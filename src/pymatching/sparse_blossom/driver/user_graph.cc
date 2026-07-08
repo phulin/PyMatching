@@ -748,10 +748,17 @@ void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& re
         // This is documented behavior for performance optimization
 
         // Direct graph weight updates
-        // Calculate normalized weights using the mwpm's normalization constant
+        // Calculate normalized weights using the mwpm's normalization constant.
+        // NOTE: graph.normalising_constant already has the factor of 2 baked in
+        // (see iter_discretized_edges, which returns `normalising_constant * 2`).
+        // Build-time discretization is `round(weight * nc_base) * 2` where
+        // nc_base == graph.normalising_constant / 2, so we must divide by 2 inside
+        // the round() to match it. Multiplying by graph.normalising_constant and
+        // then by 2 would apply the factor of 2 twice, doubling every reweighted
+        // edge's integer weight.
         for (auto& rw : _active_reweights) {
-            rw.original_normalized_weight = (weight_int)round(rw.original_weight * mwpm.flooder.graph.normalising_constant) * 2;
-            rw.new_normalized_weight = (weight_int)round(rw.new_weight * mwpm.flooder.graph.normalising_constant) * 2;
+            rw.original_normalized_weight = (weight_int)round(rw.original_weight * mwpm.flooder.graph.normalising_constant / 2) * 2;
+            rw.new_normalized_weight = (weight_int)round(rw.new_weight * mwpm.flooder.graph.normalising_constant / 2) * 2;
         }
 
         // Update weights directly in existing graphs

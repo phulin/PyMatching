@@ -487,6 +487,82 @@ class TestEdgeReweighting:
         restored = m.decode(syndrome)
         np.testing.assert_array_equal(original, restored)
 
+    def test_tier1_reweight_matches_freshly_built_matcher(self):
+        """Regression for the factor-of-2 being applied twice in Tier 1.
+
+        A Tier-1 reweight (new weight <= original max, no regeneration) must
+        produce the same correction *and* solution weight as a matcher built
+        from scratch with those weights. boundary(0)=5.0 pins the maximum weight
+        so the reweighted graph and the oracle share the same normalisation
+        (a fair comparison; Tier-1 reweighting deliberately reuses the original
+        graph's normalisation). Non-integer weights give fine discretisation so
+        the reported weight is exact. Reweighting edge (0, 1) from 2.7 to 0.9
+        keeps it the cheapest match for syndrome [1, 1]; if the weight is
+        silently doubled (~1.8) the reported solution weight no longer matches
+        the oracle.
+        """
+        def build(edge01):
+            m = Matching()
+            m.add_edge(0, 1, weight=edge01, fault_ids=0)
+            m.add_boundary_edge(0, weight=5.0, fault_ids=1)  # pins max_abs_weight
+            m.add_boundary_edge(1, weight=1.3, fault_ids=2)
+            return m
+
+        syndrome = np.array([1, 1])
+
+        reweighted = build(2.7)
+        corr, weight = reweighted.decode(
+            syndrome,
+            edge_reweights=np.array([[0, 1, 0.9]], dtype=np.float64),
+            return_weight=True,
+        )
+
+        # Fair oracle: built from scratch with the same weights and the same max
+        # weight (5.0), hence the same discretisation as the reweighted graph.
+        oracle = build(0.9)
+        corr_oracle, weight_oracle = oracle.decode(syndrome, return_weight=True)
+
+        np.testing.assert_array_equal(corr, corr_oracle)
+        assert np.isclose(weight, weight_oracle)
+        # Concretely: edge (0, 1) (fault 0) wins at weight 0.9, not a doubled 1.8.
+        np.testing.assert_array_equal(corr, np.array([1, 0, 0]))
+        assert np.isclose(weight, 0.9)
+
+    def test_reweight_does_not_contaminate_later_shots(self):
+        """Regression for reweight contamination across shots in a batch.
+
+        The restore path must return a reweighted edge to its *exact* original
+        discretized weight, not a doubled value. A reweight applied to shot 0
+        must not change the result of shot 1, which carries no reweight.
+        """
+        def build():
+            m = Matching()
+            m.add_edge(0, 1, weight=1.0, fault_ids=0)
+            m.add_edge(1, 2, weight=1.0, fault_ids=1)
+            m.add_boundary_edge(0, weight=1.2, fault_ids=2)
+            m.add_boundary_edge(2, weight=1.2, fault_ids=3)
+            return m
+
+        # Shot 0 is trivial but carries a Tier-1 reweight of edge (0, 1) -> 0.0.
+        # Shot 1 carries no reweight; its optimal matching uses edge (0, 1).
+        shots = np.array([[0, 0, 0], [1, 1, 0]], dtype=np.uint8)
+
+        reweighted = build()
+        _, w_reweighted = reweighted.decode_batch(
+            shots,
+            edge_reweights=[np.array([[0, 1, 0.0]], dtype=np.float64), None],
+            reweight_stride=1,
+            return_weights=True,
+        )
+
+        # Ground truth: shot 1 decoded on its own with a pristine matcher.
+        ref = build()
+        _, w_ref = ref.decode(shots[1], return_weight=True)
+
+        # Shot 1 has no reweight, so its weight must be independent of shot 0.
+        assert np.isclose(w_reweighted[1], w_ref)
+        assert np.isclose(w_reweighted[1], 1.0)
+
 
 if __name__ == "__main__":
     pytest.main([__file__])
