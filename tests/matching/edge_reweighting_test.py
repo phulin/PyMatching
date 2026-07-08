@@ -563,6 +563,78 @@ class TestEdgeReweighting:
         assert np.isclose(w_reweighted[1], w_ref)
         assert np.isclose(w_reweighted[1], 1.0)
 
+    def test_batch_regeneration_does_not_persist_reweights(self):
+        """Regression for bug #2: a multi-block batch that triggers regeneration.
+
+        When a batch contains a reweight above the original max weight
+        (batch regeneration) AND more than one block, the apply and restore of
+        block 0 must use the *same* tier. Otherwise block 0's reweight is written
+        into the UserGraph (Tier-2 apply) but never undone (Tier-1 restore) and
+        persists forever. Here block 0 reweights edge (0, 1) -> 5.0 (> max 1.0);
+        after the batch every edge must equal its original weight.
+        """
+        def build():
+            m = Matching()
+            m.add_edge(0, 1, weight=1.0, fault_ids=0)   # original max weight = 1.0
+            m.add_edge(1, 2, weight=1.0, fault_ids=1)
+            m.add_boundary_edge(0, weight=1.0, fault_ids=2)
+            m.add_boundary_edge(2, weight=1.0, fault_ids=3)
+            return m
+
+        def w01(m):
+            return next(a["weight"] for x, y, a in m.edges() if {x, y} == {0, 1})
+
+        m = build()
+        shots = np.array([[1, 0, 1], [1, 0, 1]], dtype=np.uint8)
+        # block 0: edge (0,1) -> 5.0 (> max => regeneration); block 1: None.
+        m.decode_batch(
+            shots,
+            edge_reweights=[np.array([[0, 1, 5.0]], dtype=np.float64), None],
+            reweight_stride=1,
+        )
+
+        assert np.isclose(w01(m), 1.0)          # UserGraph reverted
+        m.decode(np.array([1, 0, 1]))           # a later regeneration
+        assert np.isclose(w01(m), 1.0)          # still reverted
+
+    def test_batch_regeneration_does_not_contaminate_later_shots(self):
+        """Regression for bug #2: later shots must decode on the original graph.
+
+        Even a shot with no reweight, following a regeneration-triggering block,
+        must decode exactly as on the original graph -- the block-0 reweight must
+        not leak into it (previously it saw the reweighted edge at weight 0).
+        """
+        def build(w01=2.0):
+            m = Matching()
+            m.add_edge(0, 1, weight=w01, fault_ids=0)
+            m.add_edge(1, 2, weight=2.0, fault_ids=1)
+            m.add_boundary_edge(0, weight=1.0, fault_ids=2)
+            m.add_boundary_edge(2, weight=1.0, fault_ids=3)
+            return m
+
+        syn = np.array([1, 1, 0])  # edge (0,1) route competes with the boundary route
+        shots = np.tile(syn, (2, 1))
+
+        m = build()
+        preds, ws = m.decode_batch(
+            shots,
+            edge_reweights=[np.array([[0, 1, 5.0]], dtype=np.float64), None],
+            reweight_stride=1,
+            return_weights=True,
+        )
+
+        # Shot 0 uses the reweighted graph (edge=5.0): the boundary route wins.
+        corr0, w0 = build(w01=5.0).decode(syn, return_weight=True)
+        np.testing.assert_array_equal(preds[0], corr0)
+        assert np.isclose(ws[0], w0)
+
+        # Shot 1 has NO reweight: must decode as the ORIGINAL graph (edge=2.0),
+        # i.e. edge (0,1) wins at weight 2.0 -- not a zeroed/contaminated edge.
+        corr1, w1 = build().decode(syn, return_weight=True)
+        np.testing.assert_array_equal(preds[1], corr1)
+        assert np.isclose(ws[1], w1)
+        assert np.isclose(ws[1], 2.0)
+
 
 if __name__ == "__main__":
     pytest.main([__file__])

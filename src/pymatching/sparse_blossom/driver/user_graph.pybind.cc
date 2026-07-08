@@ -337,7 +337,12 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
 
             // Handle edge reweights if provided - expect list of arrays for reweight rules
             bool has_reweights = !edge_reweights.is_none();
-            bool batch_needs_regeneration = false;
+            // Per-block regeneration decision. Each block's apply AND restore use the
+            // SAME flag, so a block that mutates the UserGraph (Tier 2) is always undone
+            // by a matching Tier-2 restore. `active_block_regen` tracks the in-flight
+            // block so an exception mid-block still restores with the correct tier.
+            std::vector<char> block_needs_regen;
+            bool active_block_regen = false;
             std::vector<std::vector<std::array<double, 3>>> all_reweight_specs;
 
             if (has_reweights) {
@@ -386,8 +391,24 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                     }
                 }
 
-                // Determine if batch needs regeneration
-                batch_needs_regeneration = self.batch_needs_regeneration(all_reweight_specs);
+                // Decide, per block, whether it needs regeneration (i.e. some reweight
+                // exceeds the original max weight). Computed here, before any reweight
+                // mutates the graph, so apply and restore agree on the tier for a block.
+                //
+                // TODO(perf): a block whose reweights exceed the max weight regenerates
+                // the whole matching graph on both apply and restore (2 rebuilds/block).
+                // This is correct but slow if many blocks are out-of-range. The intended
+                // optimisation is to regenerate ONCE per batch using a normalisation
+                // sized for the global batch max, run every block via Tier-1 direct
+                // updates against that fixed normalisation, then regenerate back once.
+                // That needs the normalising constant to be parameterisable by an
+                // externally supplied max (not currently exposed). In-range reweights
+                // (all Tier-1, including all erasure) are unaffected and stay fast.
+                block_needs_regen.assign(num_rules, 0);
+                for (size_t r = 0; r < num_rules; r++) {
+                    if (!all_reweight_specs[r].empty())
+                        block_needs_regen[r] = self.needs_regeneration(all_reweight_specs[r]) ? 1 : 0;
+                }
             }
 
             // Vector used to extract predicted observables when decoding if bit_packed_predictions is true
@@ -407,11 +428,22 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
 
                     // Apply reweights only at the start of each block
                     if (has_reweights && is_first_shot_in_block && !all_reweight_specs[rule_idx].empty()) {
-                        // Regeneration on first rule if needed
-                        bool needs_regeneration = (rule_idx == 0 && batch_needs_regeneration);
-                        self.apply_reweights(all_reweight_specs[rule_idx], mwpm, needs_regeneration);
-                        auto &mwpm = enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm();
+                        // Materialise any pending regeneration (from a previous block's
+                        // Tier-2 restore) before touching the graph, so a Tier-1 apply
+                        // operates on an up-to-date matching graph.
+                        (void)(enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm());
+                        active_block_regen = block_needs_regen[rule_idx];
+                        self.apply_reweights(all_reweight_specs[rule_idx], mwpm, active_block_regen);
                     }
+
+                    // Re-fetch the mwpm before decoding so any pending regeneration takes
+                    // effect: this block's Tier-2 apply, or a previous block's Tier-2
+                    // restore ahead of a block that carries no reweights. `mwpm` is a
+                    // reference to the persistent _mwpm member, so it reflects the rebuilt
+                    // graph. In the common Tier-1 path _mwpm_needs_updating stays false and
+                    // this is an O(1) cached return.
+                    if (has_reweights)
+                        (void)(enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm());
 
                     // Extract detection events for this shot
                     if (bit_packed_shots) {
@@ -460,12 +492,11 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                     }
                     detection_events.clear();
 
-                    // Restore weights only at the end of each block
+                    // Restore weights only at the end of each block. Restore uses the
+                    // SAME regeneration flag as this block's apply, so a Tier-2 apply
+                    // (which mutated the UserGraph) is always undone by a Tier-2 restore.
                     if (has_reweights && is_last_shot_in_block && !all_reweight_specs[rule_idx].empty()) {
-                        // Use batch_needs_regeneration only for the last rule
-                        bool is_last_rule = (rule_idx == all_reweight_specs.size() - 1);
-                        bool needs_regeneration = is_last_rule ? batch_needs_regeneration : false;
-                        self.restore_weights(needs_regeneration);
+                        self.restore_weights(block_needs_regen[rule_idx]);
                     }
                 }
 
@@ -473,9 +504,10 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                 return py::make_tuple(predictions, weights);
 
             } catch (...) {
-                // Ensure weights are restored even on exception (pass batch regeneration flag)
+                // Ensure weights are restored even on exception, using the in-flight
+                // block's regeneration flag so the UserGraph is undone if it was mutated.
                 if (has_reweights) {
-                    self.restore_weights(batch_needs_regeneration);
+                    self.restore_weights(active_block_regen);
                 }
                 throw;
             }
