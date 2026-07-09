@@ -182,6 +182,9 @@ class UserGraph {
     std::vector<EdgeReweight> _active_reweights;
     /// Tier recorded by apply_reweights; restore_weights undoes with the same tier.
     bool _active_reweights_regen = false;
+    /// Graph shape (search graph included?) recorded by apply_reweights; a Tier-2
+    /// restore re-materialises in this shape.
+    bool _active_reweights_with_search = false;
 
     /// Aggregate per-edge properties consumed on the per-decode hot path (tier
     /// classification, reweight guards) and by discretization sizing. Computed in

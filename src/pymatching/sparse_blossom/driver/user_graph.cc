@@ -590,6 +590,16 @@ void pm::UserGraph::apply_reweights(
     // up-to-date graph. O(1) when nothing is pending.
     pm::Mwpm& mwpm = ensure_search_graph ? get_mwpm_with_search_graph() : get_mwpm();
 
+    // Preserve an already-present search graph across Tier-2 rebuilds even when
+    // this decode doesn't need it: rebuilding without it would force the next
+    // correlations consumer (decode_to_edges_array, shortest-path queries) to pay
+    // a full rebuild, ping-ponging shapes on mixed workloads. This shape is also
+    // recorded at commit time so restore re-materialises in the shape THIS apply
+    // established, rather than probing.
+    bool with_search_graph = ensure_search_graph ||
+        (mwpm.flooder.graph.nodes.size() > 0 &&
+         mwpm.search_flooder.graph.nodes.size() == mwpm.flooder.graph.nodes.size());
+
     // Validate into a local vector and commit to _active_reweights only after the
     // whole spec list has passed (strong exception guarantee). A throw part-way
     // through must leave _active_reweights untouched: stale partial entries from a
@@ -682,6 +692,7 @@ void pm::UserGraph::apply_reweights(
     // UserGraph floats for edges the validation loop just resolved).
     _active_reweights = std::move(validated);
     _active_reweights_regen = needs_regeneration;
+    _active_reweights_with_search = with_search_graph;
 
     if (needs_regeneration) {
         // Full regeneration - need to update UserGraph edges
@@ -692,9 +703,10 @@ void pm::UserGraph::apply_reweights(
         _mwpm_needs_updating = true;
         // UserGraph edge weights changed, so the cached edge stats are stale.
         invalidate_edge_stats();
-        // Materialise the regeneration now, in the same shape, so callers decode
-        // against the reweighted graph without needing a get_mwpm() refresh.
-        (void)(ensure_search_graph ? get_mwpm_with_search_graph() : get_mwpm());
+        // Materialise the regeneration now, in the recorded shape, so callers
+        // decode against the reweighted graph without needing a get_mwpm()
+        // refresh (and without dropping a search graph a previous caller built).
+        (void)(with_search_graph ? get_mwpm_with_search_graph() : get_mwpm());
     } else {
         // Optimization 2: Skip UserGraph updates in Tier 1 mode
         // Note: edges() will return original weights during reweighted decode
@@ -744,6 +756,7 @@ void pm::UserGraph::apply_reweights(
 void pm::UserGraph::restore_weights() {
     if (_active_reweights.empty()) return;
     bool regen = _active_reweights_regen;
+    bool with_search = _active_reweights_with_search;
 
     if (regen) {
         // Full regeneration path - need to restore UserGraph edges
@@ -771,15 +784,23 @@ void pm::UserGraph::restore_weights() {
     // restore is a clean no-op rather than a replay.
     _active_reweights.clear();
     _active_reweights_regen = false;
+    _active_reweights_with_search = false;
 
     if (regen) {
-        // Materialise the regeneration back to the original graph, preserving
-        // the current shape (search graph present iff it is present now), so a
-        // following block or decode -- including one that applies no reweights
-        // -- sees the restored graph without needing a get_mwpm() refresh.
-        bool has_search_graph = _mwpm.flooder.graph.nodes.size() > 0 &&
-                                _mwpm.search_flooder.graph.nodes.size() == _mwpm.flooder.graph.nodes.size();
-        (void)(has_search_graph ? get_mwpm_with_search_graph() : get_mwpm());
+        // Materialise the regeneration back to the original graph, in the shape
+        // recorded at apply time, so a following block or decode -- including
+        // one that applies no reweights -- sees the restored graph without
+        // needing a get_mwpm() refresh. This is purely a cache warm: the graph
+        // state is already fully restored and _mwpm_needs_updating is set, so if
+        // the rebuild fails (e.g. bad_alloc) we swallow the error -- the lazy
+        // flag remains and the next decode materialises on demand. Propagating
+        // it would mask the caller's original error when restore runs from a
+        // catch handler, or discard a completed decode's result on the success
+        // path.
+        try {
+            (void)(with_search ? get_mwpm_with_search_graph() : get_mwpm());
+        } catch (...) {
+        }
     }
 }
 
