@@ -125,7 +125,7 @@ void pm::UserGraph::merge_edge_or_boundary_edge(
 
         _mwpm_needs_updating = true;
         // Invalidate caches when edge weights change
-        invalidate_max_weight_cache();
+        invalidate_edge_stats();
         if (new_error_probability < 0 || new_error_probability > 1)
             _all_edges_have_error_probabilities = false;
     }
@@ -157,7 +157,7 @@ void pm::UserGraph::add_or_merge_edge(
         }
         _mwpm_needs_updating = true;
         // Invalidate caches when graph structure changes
-        invalidate_max_weight_cache();
+        invalidate_edge_stats();
         if (error_probability < 0 || error_probability > 1)
             _all_edges_have_error_probabilities = false;
     } else {
@@ -187,7 +187,7 @@ void pm::UserGraph::add_or_merge_boundary_edge(
         }
         _mwpm_needs_updating = true;
         // Invalidate caches when graph structure changes
-        invalidate_max_weight_cache();
+        invalidate_edge_stats();
         if (error_probability < 0 || error_probability > 1)
             _all_edges_have_error_probabilities = false;
     } else {
@@ -196,19 +196,16 @@ void pm::UserGraph::add_or_merge_boundary_edge(
 }
 
 pm::UserGraph::UserGraph()
-    : _num_observables(0), _mwpm_needs_updating(true), _all_edges_have_error_probabilities(true),
-      _cached_max_abs_weight(0), _max_weight_cache_valid(false) {
+    : _num_observables(0), _mwpm_needs_updating(true), _all_edges_have_error_probabilities(true) {
 }
 
 pm::UserGraph::UserGraph(size_t num_nodes)
-    : _num_observables(0), _mwpm_needs_updating(true), _all_edges_have_error_probabilities(true),
-      _cached_max_abs_weight(0), _max_weight_cache_valid(false) {
+    : _num_observables(0), _mwpm_needs_updating(true), _all_edges_have_error_probabilities(true) {
     nodes.resize(num_nodes);
 }
 
 pm::UserGraph::UserGraph(size_t num_nodes, size_t num_observables)
-    : _num_observables(num_observables), _mwpm_needs_updating(true), _all_edges_have_error_probabilities(true),
-      _cached_max_abs_weight(0), _max_weight_cache_valid(false) {
+    : _num_observables(num_observables), _mwpm_needs_updating(true), _all_edges_have_error_probabilities(true) {
     nodes.resize(num_nodes);
 }
 
@@ -285,51 +282,51 @@ bool pm::UserGraph::all_edges_have_error_probabilities() {
     return _all_edges_have_error_probabilities;
 }
 
-double pm::UserGraph::max_abs_weight() {
-    // Use cached value if available (Optimization 5)
-    if (_max_weight_cache_valid) {
-        return _cached_max_abs_weight;
+const pm::UserGraph::EdgeStats& pm::UserGraph::edge_stats() const {
+    // One traversal computes every per-edge aggregate the reweighting hot path
+    // needs. Crucially, max_abs_weight_incl_implied is the SAME maximum
+    // get_edge_weight_normalising_constant sizes the discretization by, and
+    // all_integral matches its integer-resolution collapse -- computing them in
+    // one place means the tier classifier and the discretization can never
+    // silently desynchronise. Cached because needs_regeneration runs per
+    // reweighted decode; an uncached O(E) list traversal measurably slows
+    // Tier-1 (e.g. +35us at E=26k for the previously-uncached integral scan).
+    if (_edge_stats.valid) {
+        return _edge_stats;
     }
-
-    double max_weight = 0;
-    for (auto& e : edges) {
-        if (std::abs(e.weight) > max_weight) {
-            max_weight = std::abs(e.weight);
+    EdgeStats stats;
+    for (const auto& e : edges) {
+        double abs_w = std::abs(e.weight);
+        if (abs_w > stats.max_abs_weight)
+            stats.max_abs_weight = abs_w;
+        if (e.weight < 0)
+            stats.has_negative_weight = true;
+        if (round(e.weight) != e.weight)
+            stats.all_integral = false;
+        for (const auto& implied : e.implied_weights_for_other_edges) {
+            double abs_iw = std::abs(implied.implied_weight);
+            if (abs_iw > stats.max_abs_weight_incl_implied)
+                stats.max_abs_weight_incl_implied = abs_iw;
+            if (round(implied.implied_weight) != implied.implied_weight)
+                stats.all_integral = false;
         }
     }
+    stats.max_abs_weight_incl_implied = std::max(stats.max_abs_weight_incl_implied, stats.max_abs_weight);
+    stats.valid = true;
+    _edge_stats = stats;
+    return _edge_stats;
+}
 
-    // Cache the result
-    _cached_max_abs_weight = max_weight;
-    _max_weight_cache_valid = true;
-
-    return max_weight;
+double pm::UserGraph::max_abs_weight() {
+    return edge_stats().max_abs_weight;
 }
 
 double pm::UserGraph::max_abs_weight_including_implied() {
-    // The same maximum get_edge_weight_normalising_constant sizes the
-    // discretization by: edges AND implied correlation weights. Kept separate
-    // from max_abs_weight() (edge-only, cached, part of the public surface).
-    // Cached because needs_regeneration calls this on the per-decode hot path;
-    // an uncached O(E) list traversal per reweighted decode measurably slows
-    // Tier-1 (invalidated together with the edge-only cache).
-    if (_max_weight_incl_implied_cache_valid) {
-        return _cached_max_abs_weight_incl_implied;
-    }
-    double max_weight = max_abs_weight();
-    for (auto& e : edges) {
-        for (const auto& implied : e.implied_weights_for_other_edges) {
-            if (std::abs(implied.implied_weight) > max_weight)
-                max_weight = std::abs(implied.implied_weight);
-        }
-    }
-    _cached_max_abs_weight_incl_implied = max_weight;
-    _max_weight_incl_implied_cache_valid = true;
-    return max_weight;
+    return edge_stats().max_abs_weight_incl_implied;
 }
 
-void pm::UserGraph::invalidate_max_weight_cache() {
-    _max_weight_cache_valid = false;
-    _max_weight_incl_implied_cache_valid = false;
+void pm::UserGraph::invalidate_edge_stats() {
+    _edge_stats.valid = false;
 }
 
 pm::MatchingGraph pm::UserGraph::to_matching_graph(pm::weight_int num_distinct_weights) {
@@ -487,25 +484,9 @@ void pm::UserGraph::set_min_num_observables(size_t num_observables) {
 }
 
 double pm::UserGraph::get_edge_weight_normalising_constant(size_t max_num_distinct_weights) {
-    double max_abs_weight = 0;
-    bool all_integral_weight = true;
+    // Validate implied-weight rewrite rules (edge existence, no sign change).
     for (auto& e : edges) {
-        if (std::abs(e.weight) > max_abs_weight)
-            max_abs_weight = std::abs(e.weight);
-
-        if (round(e.weight) != e.weight) {
-            all_integral_weight = false;
-        }
-
-        for (auto implied : e.implied_weights_for_other_edges) {
-            if (std::abs(implied.implied_weight) > max_abs_weight) {
-                max_abs_weight = std::abs(implied.implied_weight);
-            }
-
-            if (round(implied.implied_weight) != implied.implied_weight) {
-                all_integral_weight = false;
-            }
-
+        for (const auto& implied : e.implied_weights_for_other_edges) {
             double current_weight;
             bool has_edge = get_edge_or_boundary_edge_weight(implied.node1, implied.node2, current_weight);
             if (!has_edge) {
@@ -521,15 +502,20 @@ double pm::UserGraph::get_edge_weight_normalising_constant(size_t max_num_distin
         }
     }
 
-    if (max_abs_weight > pm::MAX_USER_EDGE_WEIGHT)
+    // Size the constant from the shared edge stats -- the SAME values
+    // needs_regeneration classifies tiers against, so the two cannot
+    // desynchronise.
+    const EdgeStats& stats = edge_stats();
+
+    if (stats.max_abs_weight_incl_implied > pm::MAX_USER_EDGE_WEIGHT)
         throw std::invalid_argument(
             "maximum absolute edge weight of " + std::to_string(pm::MAX_USER_EDGE_WEIGHT) + " exceeded.");
 
-    if (all_integral_weight) {
+    if (stats.all_integral) {
         return 1.0;
     } else {
         pm::weight_int max_half_edge_weight = max_num_distinct_weights - 1;
-        return (double)max_half_edge_weight / max_abs_weight;
+        return (double)max_half_edge_weight / stats.max_abs_weight_incl_implied;
     }
 }
 
@@ -585,24 +571,24 @@ pm::UserGraph pm::detector_error_model_to_user_graph(
 
 void pm::UserGraph::apply_reweights(
     const std::vector<std::array<double, 3>>& reweight_specs, bool needs_regeneration, bool ensure_search_graph) {
+    // Reject reweighting on graphs with any negative edge weight: the matching
+    // graph stores abs(weight) in the slot plus baked-in compensation (virtual
+    // detection events, pre-flipped observables, negative_weight_sum) that an
+    // in-place Tier-1 write cannot maintain. The check reads the UserGraph FLOAT
+    // weights, so it is uniform: it cannot be parity-cancelled by cycles of
+    // negative edges (the old detection-events check) and does not depend on
+    // whether a tiny negative weight happens to discretize to 0 (the discretized
+    // negative_weight_sum). Checked before materialising, so a rejected call
+    // does no graph work.
+    if (edge_stats().has_negative_weight) {
+        throw std::invalid_argument("Edge reweighting not supported with negative edge weights");
+    }
+
     // Materialise the graph in the requested shape before touching anything, so
     // any regeneration still pending (e.g. from a previous Tier-2 restore or a
     // graph mutation) is applied and the Tier-1 snapshots below target the
     // up-to-date graph. O(1) when nothing is pending.
     pm::Mwpm& mwpm = ensure_search_graph ? get_mwpm_with_search_graph() : get_mwpm();
-
-    // Reject reweighting on graphs with any negative edge weight: the matching
-    // graph stores abs(weight) in the slot plus baked-in compensation (virtual
-    // detection events, pre-flipped observables, negative_weight_sum) that an
-    // in-place Tier-1 write cannot maintain. negative_weight_sum is the reliable
-    // signal -- every negative edge contributes a strictly negative term, so it
-    // cannot cancel. The detection-events set previously checked here is
-    // parity-toggled per endpoint and cancels to empty on cycles of negative
-    // edges (e.g. a negative triangle), which slipped past the guard and made
-    // Tier-1 reweights of those edges decode silently wrong.
-    if (mwpm.flooder.graph.negative_weight_sum != 0) {
-        throw std::invalid_argument("Edge reweighting not supported with negative edge weights");
-    }
 
     // Validate into a local vector and commit to _active_reweights only after the
     // whole spec list has passed (strong exception guarantee). A throw part-way
@@ -701,8 +687,8 @@ void pm::UserGraph::apply_reweights(
             nodes[rw.node1].neighbors[neighbor_idx].edge_it->weight = rw.new_weight;
         }
         _mwpm_needs_updating = true;
-        // UserGraph edge weights changed, so the cached max is no longer valid.
-        invalidate_max_weight_cache();
+        // UserGraph edge weights changed, so the cached edge stats are stale.
+        invalidate_edge_stats();
         // Materialise the regeneration now, in the same shape, so callers decode
         // against the reweighted graph without needing a get_mwpm() refresh.
         (void)(ensure_search_graph ? get_mwpm_with_search_graph() : get_mwpm());
@@ -764,8 +750,8 @@ void pm::UserGraph::restore_weights() {
         }
         // Trigger regeneration to restore original normalization
         _mwpm_needs_updating = true;
-        // UserGraph edge weights changed, so the cached max is no longer valid.
-        invalidate_max_weight_cache();
+        // UserGraph edge weights changed, so the cached edge stats are stale.
+        invalidate_edge_stats();
     } else {
         // Optimization 2: Skip UserGraph restoration in Tier 1 mode
         // UserGraph was never modified, so no need to restore it.
@@ -795,15 +781,7 @@ void pm::UserGraph::restore_weights() {
 }
 
 bool pm::UserGraph::all_edges_integral() const {
-    for (const auto& e : edges) {
-        if (round(e.weight) != e.weight)
-            return false;
-        for (const auto& implied : e.implied_weights_for_other_edges) {
-            if (round(implied.implied_weight) != implied.implied_weight)
-                return false;
-        }
-    }
-    return true;
+    return edge_stats().all_integral;
 }
 
 bool pm::UserGraph::needs_regeneration(const std::vector<std::array<double, 3>>& reweight_specs) {
@@ -919,6 +897,6 @@ void pm::UserGraph::populate_implied_edge_weights(
             }
         }
     }
-    // Implied weights feed max_abs_weight_including_implied's cache.
-    invalidate_max_weight_cache();
+    // Implied weights feed the cached edge stats.
+    invalidate_edge_stats();
 }

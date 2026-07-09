@@ -1036,6 +1036,21 @@ class TestNegativeWeightGraphReweights:
         pred, w = m.decode(np.array([0, 0, 0]), return_weight=True)
         assert np.isclose(w, -3.0)
 
+    def test_tiny_negative_weight_also_rejected(self):
+        # The guard reads the UserGraph FLOAT weights: a negative weight small
+        # enough to discretize to 0 (here ~-3e-5 against a max of 1000) must be
+        # rejected the same as any other negative weight. The discretized
+        # negative_weight_sum it previously checked would be 0 for this edge,
+        # making acceptance depend on the OTHER edges' magnitudes.
+        m = Matching()
+        m.add_edge(0, 1, weight=1000, fault_ids=0)
+        m.add_edge(1, 2, weight=-1000 / 2**25, fault_ids=1)
+        m.add_boundary_edge(0, weight=1000, fault_ids=2)
+        m.add_boundary_edge(2, weight=1000, fault_ids=3)
+        with pytest.raises(ValueError, match="negative edge weights"):
+            m.decode(np.array([1, 1, 0]),
+                     edge_reweights=np.array([[0, 1, 7.0]], dtype=np.float64))
+
 
 class TestImpliedWeightAwareTier:
     def test_reweight_between_edge_max_and_implied_max_matches_oracle(self):

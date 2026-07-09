@@ -168,8 +168,9 @@ class UserGraph {
     void restore_weights();
     bool needs_regeneration(const std::vector<std::array<double, 3>>& reweight_specs);
 
-    /// Invalidate the max weight cache (call when edges are modified)
-    void invalidate_max_weight_cache();
+    /// Invalidate the cached per-edge aggregate stats (call whenever edge weights
+    /// or implied weights are modified).
+    void invalidate_edge_stats();
 
    private:
     pm::Mwpm _mwpm;
@@ -182,11 +183,19 @@ class UserGraph {
     /// Tier recorded by apply_reweights; restore_weights undoes with the same tier.
     bool _active_reweights_regen = false;
 
-    // Optimization 5: Lazy max weight caching
-    double _cached_max_abs_weight;
-    bool _max_weight_cache_valid;
-    double _cached_max_abs_weight_incl_implied = 0;
-    bool _max_weight_incl_implied_cache_valid = false;
+    /// Aggregate per-edge properties consumed on the per-decode hot path (tier
+    /// classification, reweight guards) and by discretization sizing. Computed in
+    /// ONE cached O(E) traversal so the values cannot desynchronise; cleared by
+    /// invalidate_edge_stats().
+    struct EdgeStats {
+        double max_abs_weight = 0;               // edges only
+        double max_abs_weight_incl_implied = 0;  // edges + implied correlation weights
+        bool all_integral = true;                // edges + implied
+        bool has_negative_weight = false;        // any UserGraph edge float weight < 0
+        bool valid = false;
+    };
+    mutable EdgeStats _edge_stats;
+    const EdgeStats& edge_stats() const;
 
     // Internal reweighting helper methods
     /// Write `value` into every discretized-weight slot referenced by `rw` (both
