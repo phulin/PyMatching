@@ -15,10 +15,22 @@
 #ifndef PYMATCHING2_MWPM_DECODING_H
 #define PYMATCHING2_MWPM_DECODING_H
 
+#include <stdexcept>
+
 #include "pymatching/sparse_blossom/matcher/mwpm.h"
 #include "stim.h"
 
 namespace pm {
+
+/// Thrown when a syndrome has no perfect matching (odd parity in a connected component
+/// with no boundary). A distinct type lets callers catch this specific, expected
+/// condition -- e.g. to flag an undecodable shot -- without also swallowing genuine
+/// input errors such as an out-of-range detector index. Derives from
+/// std::invalid_argument for backward compatibility (still surfaces as a ValueError).
+class NoPerfectMatchingError : public std::invalid_argument {
+   public:
+    explicit NoPerfectMatchingError(const std::string& what_arg) : std::invalid_argument(what_arg) {}
+};
 
 struct ExtendedMatchingResult {
     std::vector<uint8_t> obs_crossed;
