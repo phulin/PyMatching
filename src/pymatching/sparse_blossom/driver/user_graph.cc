@@ -814,6 +814,10 @@ bool pm::UserGraph::needs_regeneration(const std::vector<std::array<double, 3>>&
     // correlation weights. Using the edge-only max would needlessly classify
     // reweights in (edge_max, implied_max] as Tier-2 (two full rebuilds per
     // decode) even though an in-place write at the actual constant is exact.
+    // NOTE: for positively-correlated decomposed DEMs the implied conditional
+    // probabilities are >= the marginals, so implied weights are <= edge
+    // weights and that band is empty in practice -- this comparison is chosen
+    // for definitional consistency with the constant, not observed behavior.
     double original_max_abs_weight = max_abs_weight_including_implied();
     double max_new_abs_weight = original_max_abs_weight;
 

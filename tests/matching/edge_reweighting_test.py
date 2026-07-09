@@ -833,10 +833,14 @@ class TestReweightInputValidation:
         return m
 
     def assert_unchanged(self, m):
+        # Exact equality: an identically built pristine matcher decodes
+        # deterministically, and the restore invariant is verbatim snapshots --
+        # np.isclose's defaults are ~170x looser than the discretization quantum
+        # and would mask a re-derived (slightly drifted) restore.
         pristine_pred, pristine_w = self.build().decode(self.SYNDROME, return_weight=True)
         pred, w = m.decode(self.SYNDROME, return_weight=True)
         assert np.array_equal(pred, pristine_pred)
-        assert np.isclose(w, pristine_w)
+        assert w == pristine_w
 
     @pytest.mark.parametrize("bad_weight", [float("nan"), float("inf"), float("-inf")])
     def test_non_finite_weight_raises(self, bad_weight):
@@ -985,14 +989,19 @@ class TestSlotAmbiguousReweights:
         pristine = Matching(H, spacelike_weights=np.array([1.3, 1.3, 1.3]))
         _, w_plain = m.decode(syndrome, return_weight=True)
         _, w_pristine = pristine.decode(syndrome, return_weight=True)
-        assert np.isclose(w_plain, w_pristine)
+        assert w_plain == w_pristine  # exact: identically built graphs
 
-    def test_min_merged_boundary_slot_reweight_matches_oracle(self):
+    @pytest.mark.parametrize("new_w", [0.3, 1.5])
+    def test_min_merged_boundary_slot_reweight_matches_oracle(self, new_w):
         # Node 0 has an explicit boundary edge AND an edge to a boundary node;
         # both min-merge into ONE discretized boundary slot (0.6 wins). A Tier-1
         # write used to stomp that slot with 1.5, erasing the smaller parallel
         # candidate and mis-attributing the cost to the slot's build-time
-        # fault_ids; a fresh build keeps min(1.5, 0.6) = 0.6.
+        # fault_ids; a fresh build keeps min(new_w, 0.6). The 0.3 case puts the
+        # reweighted boundary edge BELOW the parallel candidate, so the slot
+        # tracks it and a dropped reweight or broken restore visibly shifts the
+        # decode weight (with 1.5 alone, 0.6 wins under every value >= 0.6 and
+        # the restore assertion could never fail).
         def build(bweight=2.0):
             m = Matching()
             m.add_boundary_edge(0, weight=bweight, fault_ids=0)
@@ -1003,17 +1012,18 @@ class TestSlotAmbiguousReweights:
 
         syndrome = np.array([1, 0, 0, 0])
         m = build()
-        corr, w = m.decode(syndrome, edge_reweights=np.array([[0, -1, 1.5]]),
+        corr, w = m.decode(syndrome, edge_reweights=np.array([[0, -1, new_w]]),
                            return_weight=True)
-        corr_o, w_o = build(1.5).decode(syndrome, return_weight=True)
+        corr_o, w_o = build(new_w).decode(syndrome, return_weight=True)
         np.testing.assert_array_equal(corr, corr_o)
         assert np.isclose(w, w_o)
 
         # Restore: the shared slot must return to the build-time min (0.6), not
-        # keep the reweighted or original explicit-boundary value.
+        # keep the reweighted or original explicit-boundary value. Exact
+        # equality: identically built graphs decode deterministically.
         _, w_plain = m.decode(syndrome, return_weight=True)
         _, w_pristine = build().decode(syndrome, return_weight=True)
-        assert np.isclose(w_plain, w_pristine)
+        assert w_plain == w_pristine
 
 
 class TestNegativeWeightGraphReweights:
@@ -1073,13 +1083,20 @@ class TestNegativeWeightGraphReweights:
 
 
 class TestImpliedWeightAwareTier:
-    def test_reweight_between_edge_max_and_implied_max_matches_oracle(self):
-        """needs_regeneration compares against the max INCLUDING implied
-        correlation weights (the max the normalising constant is actually sized
-        by), so a reweight in (edge_max, implied_max] stays Tier-1 instead of
-        paying two full rebuilds. Either tier must match the oracle; this pins
-        the decode result across that classification change."""
-        import stim
+    def test_reweight_near_max_on_correlations_graph_matches_oracle(self):
+        """Tier-2 oracle check for a reweight just above the edge-only max on a
+        correlations-loaded DEM.
+
+        HONESTY NOTE: this does NOT exercise the (edge_max, implied_max] Tier-1
+        band that needs_regeneration's implied-aware max enables -- for
+        positively-correlated decomposed DEMs the implied conditional
+        probabilities are >= the marginals, so implied weights are <= edge
+        weights and that band is empty (verified for this DEM: implied_max
+        4.26 < edge_max 5.92). The implied-aware comparison remains correct by
+        definition (it uses the same max the normalising constant is sized by)
+        but is untestable from Python; exercising the band would need a C++
+        unit test that constructs implied_weights_for_other_edges directly."""
+        stim = pytest.importorskip("stim")
         c = stim.Circuit.generated(
             "surface_code:rotated_memory_z", distance=3, rounds=2,
             after_clifford_depolarization=0.01)
@@ -1104,14 +1121,70 @@ class TestImpliedWeightAwareTier:
         np.testing.assert_array_equal(pred, pred_o)
         assert np.isclose(w, w_o)
 
-        # Restore: plain decode matches a pristine matcher.
+        # Restore: plain decode matches a pristine matcher. Identically built
+        # graphs decode deterministically, so equality is exact -- a restore
+        # that re-derives instead of writing the snapshot back verbatim drifts
+        # by discretization quanta that np.isclose's defaults would mask.
         pristine = Matching.from_detector_error_model(dem, enable_correlations=True)
         pred_p, w_p = pristine.decode(syndrome, return_weight=True,
                                       enable_correlations=True)
         pred_after, w_after = m.decode(syndrome, return_weight=True,
                                        enable_correlations=True)
         np.testing.assert_array_equal(pred_after, pred_p)
-        assert np.isclose(w_after, w_p)
+        assert w_after == w_p
+
+    def test_tier1_reweighted_decode_on_correlations_dem_matches_oracle(self):
+        """The discriminating test for write_reweight_slots' search-graph half.
+
+        On a correlations-loaded DEM, pass 1 extracts matched paths on the
+        SEARCH graph and pass 2 applies implied-weight adjustments for the
+        edges those paths use -- so a dropped or misdirected Tier-1
+        search-graph write changes which adjustments fire and the final
+        weight/correction. Hand-built graphs (no implied weights) cannot
+        detect this; the earlier Tier-1 correlations test kept its matching
+        graph honest but not its search graph.
+
+        Verified fail-first: stubbing out the search-graph writes in
+        write_reweight_slots makes this test fail.
+        """
+        stim = pytest.importorskip("stim")
+        c = stim.Circuit.generated(
+            "surface_code:rotated_memory_z", distance=3, rounds=2,
+            after_clifford_depolarization=0.01)
+        dem = c.detector_error_model(decompose_errors=True)
+        nd = dem.num_detectors
+
+        def fresh():
+            return Matching.from_detector_error_model(dem, enable_correlations=True)
+
+        m = fresh()
+        edges = [(a, b, d) for a, b, d in m.edges() if b is not None]
+        a, b, d0 = edges[0]
+        new_w = 0.01  # far below max -> Tier-1; cheap enough to attract pass-1 paths
+
+        oracle = fresh()
+        oracle.add_edge(a, b, weight=new_w, fault_ids=d0["fault_ids"],
+                        error_probability=d0["error_probability"],
+                        merge_strategy="replace")
+
+        rng = np.random.default_rng(7)
+        shots = (rng.random((100, nd)) < 0.04).astype(np.uint8)
+        rw = np.array([[a, b, new_w]])
+        for syn in shots:
+            pred, w = m.decode(syn, edge_reweights=rw, return_weight=True,
+                               enable_correlations=True)
+            pred_o, w_o = oracle.decode(syn, return_weight=True,
+                                        enable_correlations=True)
+            np.testing.assert_array_equal(pred, pred_o)
+            assert np.isclose(w, w_o)
+
+        # Restore: exact equality against a pristine matcher.
+        pristine = fresh()
+        syn = shots[0]
+        pred_after, w_after = m.decode(syn, return_weight=True, enable_correlations=True)
+        pred_p, w_p = pristine.decode(syn, return_weight=True, enable_correlations=True)
+        np.testing.assert_array_equal(pred_after, pred_p)
+        assert w_after == w_p
 
 
 class TestTier1Coverage:
@@ -1150,7 +1223,7 @@ class TestTier1Coverage:
         corr_p, w_p = self.build().decode(syndrome, enable_correlations=True, return_weight=True)
         corr_after, w_after = m.decode(syndrome, enable_correlations=True, return_weight=True)
         np.testing.assert_array_equal(corr_after, corr_p)
-        assert np.isclose(w_after, w_p)
+        assert w_after == w_p  # exact: identically built graphs
 
     def test_tier1_exception_restore(self):
         # Both pre-existing exception-safety tests use all-integral graphs, so
@@ -1193,7 +1266,7 @@ class TestTier1Coverage:
         # Restore: back to the build value, not 0.9.
         _, w_after = m.decode(syndrome, return_weight=True)
         _, w_pristine = self.build().decode(syndrome, return_weight=True)
-        assert np.isclose(w_after, w_pristine)
+        assert w_after == w_pristine  # exact: identically built graphs
 
     def test_multi_shot_tier1_block_values(self):
         # Shots 2..k of a Tier-1 block must decode against the in-place
