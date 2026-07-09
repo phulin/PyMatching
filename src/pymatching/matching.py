@@ -255,6 +255,16 @@ class Matching:
             `stim.DetectorErrorModel` with `enable_correlations=True`. For a description
             of the correlated matching algorithm, see https://arxiv.org/abs/1310.0863.
             By default, False
+        edge_reweights : numpy.ndarray, optional
+            A 2D array of shape `(num_reweights, 3)` where each row `[node1, node2, weight]`
+            temporarily overrides the weight of edge `(node1, node2)` for this decode call
+            only; original weights are restored before the method returns, and
+            `Matching.edges()` always reflects the original weights. Use exactly `-1` for
+            `node2` to reweight the boundary edge of `node1`. Weights must be finite,
+            non-negative and at most 2**24 - 1 = 16777215; node indices must be
+            non-negative integers naming an existing edge. Invalid rows raise `ValueError`,
+            as does reweighting any graph that contains negative edge weights. A zero-row
+            array is equivalent to `None`. By default, None.
 
         Returns
         -------
@@ -356,7 +366,7 @@ class Matching:
             enable_correlations: bool = False,
             edge_reweights: List[np.ndarray] = None,
             reweight_stride: int = 1,
-            logical_error_if_no_matching: bool = False) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+            return_no_matching: bool = False) -> Union[np.ndarray, Tuple[np.ndarray, ...]]:
         """
         Decode from a 2D `shots` array containing a batch of syndrome measurements. A faster
         alternative to using `pymatching.Matching.decode` and iterating over the shots in Python.
@@ -409,7 +419,15 @@ class Matching:
             When reweight_stride>1, each reweight rule applies to `reweight_stride` consecutive
             shots, so len(edge_reweights) × reweight_stride must equal the number of shots.
 
-            Use None for rules that don't modify any weights. By default, None.
+            Weights are applied only for the shots in the rule's block and restored
+            afterwards (`Matching.edges()` always reflects the original weights). Weights
+            must be finite, non-negative and at most 2**24 - 1 = 16777215; node indices
+            must be non-negative integers naming an existing edge. Invalid rows raise
+            `ValueError`, as does reweighting any graph that contains negative edge
+            weights.
+
+            Use None (or an empty array) for rules that don't modify any weights.
+            By default, None.
         reweight_stride : int, optional
             The number of consecutive shots each reweight rule applies to. Default is 1,
             meaning each rule applies to exactly one shot (backward compatible behavior).
@@ -423,11 +441,12 @@ class Matching:
 
             This reduces memory overhead and apply/restore cycles when the same reweighting
             applies to multiple consecutive shots.
-        logical_error_if_no_matching : bool, optional
-            If True, shots where no perfect matching can be found (e.g. due to odd parity
-            in a connected component without a boundary) will have all observable prediction
-            bits set to 1 instead of raising an exception. This effectively forces those shots
-            to be counted as logical errors. By default, False.
+        return_no_matching : bool, optional
+            If True, also return a boolean array `no_matching` of shape `(num_shots,)`, where
+            `no_matching[i]` is True iff shot `i` had no perfect matching. Such shots do not
+            raise; their `predictions` row is a placeholder (all observables set to 1) and
+            their weight is `inf`. This is the recommended way to handle undecodable shots:
+            the caller decides how to score them. By default, False.
 
         Returns
         -------
@@ -437,7 +456,12 @@ class Matching:
             fault id `j` was flipped in the shot `i`.
         weights: np.ndarray
             The weights of the MWPM solutions, a numpy array of `dtype=float`. `weights[i]` is the weight of the
-            MWPM solution in shot `i`.
+            MWPM solution in shot `i`. Present only if `return_weights==True`. A shot with no
+            perfect matching (see `return_no_matching`) has weight `inf`.
+        no_matching: np.ndarray
+            A boolean array of shape `(num_shots,)`; `no_matching[i]` is True iff shot `i` had no
+            perfect matching. Present only if `return_no_matching==True`. When both `return_weights`
+            and `return_no_matching` are True, the return order is `(predictions, weights, no_matching)`.
 
         Examples
         --------
@@ -494,19 +518,21 @@ class Matching:
         ... ]
         >>> predictions = m.decode_batch(shots, edge_reweights=reweights, reweight_stride=2)
         """
-        predictions, weights = self._matching_graph.decode_batch(
+        predictions, weights, no_matching = self._matching_graph.decode_batch(
             shots,
             bit_packed_predictions=bit_packed_predictions,
             bit_packed_shots=bit_packed_shots,
             enable_correlations=enable_correlations,
             edge_reweights=edge_reweights,
             reweight_stride=reweight_stride,
-            logical_error_if_no_matching=logical_error_if_no_matching
+            return_no_matching=return_no_matching,
         )
+        result = (predictions,)
         if return_weights:
-            return predictions, weights
-        else:
-            return predictions
+            result += (weights,)
+        if return_no_matching:
+            result += (no_matching.astype(bool),)
+        return result[0] if len(result) == 1 else result
 
     def decode_to_edges_array(self,
                               syndrome: Union[np.ndarray, List[bool], List[int]],
@@ -968,11 +994,9 @@ class Matching:
         (the error probability of the edge, set to -1 if not specified).
 
         .. note::
-            For performance optimization, when using ``edge_reweights`` with ``decode()`` or
-            ``decode_batch()`` in Tier 1 mode (when reweight values don't exceed the original
-            maximum weight), this method returns the **original** edge weights, not the
-            temporarily reweighted values. The reweighted values are only applied to the
-            internal matching graph structures used for decoding.
+            Per-shot ``edge_reweights`` passed to ``decode()`` or ``decode_batch()`` are
+            applied only for the duration of the decode call and then restored, so this
+            method always returns the graph's **original** edge weights.
 
         Returns
         -------

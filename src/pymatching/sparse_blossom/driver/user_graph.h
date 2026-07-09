@@ -53,27 +53,10 @@ struct EdgeReweight {
     size_t matching_graph_node2_neighbor_idx;  // SIZE_MAX if boundary edge
     size_t search_graph_node1_neighbor_idx;
     size_t search_graph_node2_neighbor_idx;    // SIZE_MAX if boundary edge
+    /// Snapshot of the discretized weight the graph held at apply time; restore
+    /// writes it back verbatim (re-deriving it from original_weight risks
+    /// mismatching the build-time discretization).
     weight_int original_normalized_weight;
-    weight_int new_normalized_weight;
-};
-
-/// Cached edge indices for fast lookup during reweighting
-struct EdgeIndexCache {
-    size_t matching_graph_node1_neighbor_idx;
-    size_t matching_graph_node2_neighbor_idx;  // SIZE_MAX if boundary edge
-    size_t search_graph_node1_neighbor_idx;
-    size_t search_graph_node2_neighbor_idx;    // SIZE_MAX if boundary edge
-    size_t user_graph_neighbor_idx;            // Index in UserGraph adjacency list
-};
-
-/// Hash function for pair<size_t, size_t> to use in unordered_map
-struct PairHash {
-    size_t operator()(const std::pair<size_t, size_t>& p) const {
-        // Use a simple hash combining technique
-        size_t h1 = std::hash<size_t>{}(p.first);
-        size_t h2 = std::hash<size_t>{}(p.second);
-        return h1 ^ (h2 << 1);
-    }
 };
 
 struct UserNeighbor {
@@ -137,7 +120,15 @@ class UserGraph {
     void add_noise(uint8_t* error_arr, uint8_t* syndrome_arr) const;
     bool all_edges_have_error_probabilities();
     double max_abs_weight();
+    /// Max over edge weights AND implied correlation weights -- the maximum that
+    /// get_edge_weight_normalising_constant sizes the discretization by.
+    double max_abs_weight_including_implied();
     double get_edge_weight_normalising_constant(size_t max_num_distinct_weights);
+    /// Returns true iff every edge weight (and implied weight) is an integer. In that
+    /// case get_edge_weight_normalising_constant collapses to 1.0, giving integer-only
+    /// discretization resolution -- so a fractional reweight cannot be represented in
+    /// place and must trigger a full regeneration (see needs_regeneration).
+    bool all_edges_integral() const;
     template <typename EdgeCallable, typename BoundaryEdgeCallable>
     double iter_discretized_edges(
         pm::weight_int num_distinct_weights,
@@ -161,20 +152,32 @@ class UserGraph {
     void populate_implied_edge_weights(
         std::map<std::pair<size_t, size_t>, std::map<std::pair<size_t, size_t>, double>>& joint_probabilites);
 
-    // Edge reweighting methods
-    void apply_reweights(const std::vector<std::array<double, 3>>& reweight_specs, pm::Mwpm& mwpm, bool needs_regeneration = false);
-    void restore_weights(bool needs_regeneration = false);
-    bool needs_regeneration(const std::vector<std::array<double, 3>>& reweight_specs);
-    bool batch_needs_regeneration(const std::vector<std::vector<std::array<double, 3>>>& all_reweight_specs);
+    // Edge reweighting methods.
+    /// Parse and fully validate raw [node1, node2, weight] reweight specs into
+    /// EdgeReweight entries, resolving the -1 boundary sentinel and capturing
+    /// each edge's current weight. Throws std::invalid_argument on any malformed
+    /// spec or nonexistent edge; touches no graph state. This is the SINGLE
+    /// parser of the wire format, consumed by both needs_regeneration and
+    /// apply_reweights, so tier classification and application can never
+    /// interpret a spec differently.
+    std::vector<EdgeReweight> parse_reweight_specs(const std::vector<std::array<double, 3>>& reweight_specs);
+    /// Apply parsed reweights. `needs_regeneration` selects the tier (the caller
+    /// decides it -- decode_batch must precompute per-block tiers against the
+    /// unmutated graph); `ensure_search_graph` selects the graph shape to
+    /// materialise (pass enable_correlations). Materialises the graph itself:
+    /// callers need no get_mwpm() refresh before or after.
+    void apply_reweights(
+        std::vector<EdgeReweight>&& parsed_reweights,
+        bool needs_regeneration,
+        bool ensure_search_graph);
+    /// Undo the last apply_reweights, using the tier recorded at apply time (a
+    /// mismatched tier pair is unrepresentable). No-op if nothing is applied.
+    void restore_weights();
+    bool needs_regeneration(const std::vector<EdgeReweight>& parsed_reweights);
 
-    /// Prepare batch reweights by pre-validating and caching edge indices for all unique edges
-    void prepare_batch_reweights(const std::vector<std::vector<std::array<double, 3>>>& all_reweight_specs, pm::Mwpm& mwpm);
-
-    /// Get cached max absolute weight (lazy evaluation)
-    double get_cached_max_abs_weight();
-
-    /// Invalidate the max weight cache (call when edges are modified)
-    void invalidate_max_weight_cache();
+    /// Invalidate the cached per-edge aggregate stats (call whenever edge weights
+    /// or implied weights are modified).
+    void invalidate_edge_stats();
 
    private:
     pm::Mwpm _mwpm;
@@ -184,33 +187,31 @@ class UserGraph {
 
     // Reweighting state
     std::vector<EdgeReweight> _active_reweights;
+    /// Tier recorded by apply_reweights; restore_weights undoes with the same tier.
+    bool _active_reweights_regen = false;
+    /// Graph shape (search graph included?) recorded by apply_reweights; a Tier-2
+    /// restore re-materialises in this shape.
+    bool _active_reweights_with_search = false;
 
-    // Optimization 1: Pre-computed edge index lookup table
-    // Maps (min(node1, node2), max(node1, node2)) -> EdgeIndexCache
-    // For boundary edges, node2 is SIZE_MAX
-    std::unordered_map<std::pair<size_t, size_t>, EdgeIndexCache, PairHash> _edge_index_cache;
-    bool _edge_index_cache_valid;
-
-    // Optimization 3: Reusable reweight buffer to avoid heap allocations
-    std::vector<EdgeReweight> _reweight_buffer;
-
-    // Optimization 5: Lazy max weight caching
-    double _cached_max_abs_weight;
-    bool _max_weight_cache_valid;
+    /// Aggregate per-edge properties consumed on the per-decode hot path (tier
+    /// classification, reweight guards) and by discretization sizing. Computed in
+    /// ONE cached O(E) traversal so the values cannot desynchronise; cleared by
+    /// invalidate_edge_stats().
+    struct EdgeStats {
+        double max_abs_weight = 0;               // edges only
+        double max_abs_weight_incl_implied = 0;  // edges + implied correlation weights
+        bool all_integral = true;                // edges + implied
+        bool has_negative_weight = false;        // any UserGraph edge float weight < 0
+        bool valid = false;
+    };
+    mutable EdgeStats _edge_stats;
+    const EdgeStats& edge_stats() const;
 
     // Internal reweighting helper methods
-    void update_existing_graph_weights();
-    size_t find_neighbor_index_in_matching_graph(size_t node1, size_t node2);
-    size_t find_neighbor_index_in_search_graph(size_t node1, size_t node2);
-
-    /// Build the edge index cache (called lazily on first reweight operation)
-    void build_edge_index_cache(pm::Mwpm& mwpm);
-
-    /// Get or create cached edge indices for a given edge
-    const EdgeIndexCache* get_edge_index_cache(size_t node1, size_t node2, pm::Mwpm& mwpm);
-
-    /// Create a canonical key for edge lookup (ensures consistent ordering)
-    static std::pair<size_t, size_t> make_edge_key(size_t node1, size_t node2);
+    /// Write `value` into every discretized-weight slot referenced by `rw` (both
+    /// edge directions, in the matching graph and -- if present -- the search
+    /// graph). Used by Tier-1 apply (new weight) and restore (snapshot).
+    void write_reweight_slots(const EdgeReweight& rw, weight_int value);
 };
 
 double to_weight_for_correlations(double probability);

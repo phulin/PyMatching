@@ -14,6 +14,9 @@
 
 #include "pymatching/sparse_blossom/driver/user_graph.pybind.h"
 
+#include <cstring>
+#include <limits>
+
 #include "pybind11/pybind11.h"
 #include "pymatching/sparse_blossom/driver/mwpm_decoding.h"
 #include "pymatching/sparse_blossom/driver/user_graph.h"
@@ -82,6 +85,16 @@ pm::MERGE_STRATEGY merge_strategy_from_string(const std::string &merge_strategy)
     } else {
         throw std::invalid_argument("Merge strategy \"" + merge_strategy + "\" not recognised.");
     }
+}
+
+// Validate that an edge_reweights array has the expected (N, 3) shape before its
+// elements are read with unchecked<2>(), which performs no bounds checking (reading
+// a column that does not exist is an out-of-bounds access).
+static void validate_reweights_array(const py::array_t<double> &arr) {
+    if (arr.ndim() != 2 || arr.shape(1) != 3)
+        throw std::invalid_argument(
+            "edge_reweights must be a 2D array of shape (N, 3) with columns "
+            "[node1, node2, weight]");
 }
 
 void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGraph> &g) {
@@ -184,14 +197,14 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
            py::object edge_reweights = py::none()) {
             auto &mwpm = enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm();
             bool has_reweights = !edge_reweights.is_none();
-            bool needs_regeneration = false;
 
-            // Handle edge reweights if provided
+            // Parse the reweight specs (pure -- touches no graph state, safe
+            // outside the try).
+            std::vector<std::array<double, 3>> reweight_specs;
             if (has_reweights) {
                 py::array_t<double> reweights_array = edge_reweights.cast<py::array_t<double>>();
+                validate_reweights_array(reweights_array);
                 auto reweights_unchecked = reweights_array.unchecked<2>();
-                std::vector<std::array<double, 3>> reweight_specs;
-
                 for (py::ssize_t i = 0; i < reweights_unchecked.shape(0); i++) {
                     reweight_specs.push_back({
                         reweights_unchecked(i, 0),
@@ -199,41 +212,59 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                         reweights_unchecked(i, 2)
                     });
                 }
-
-                // Determine if regeneration is needed
-                needs_regeneration = self.needs_regeneration(reweight_specs);
-
-                // Get mwpm first, then apply reweights with the mwpm object
-                self.apply_reweights(reweight_specs, mwpm, needs_regeneration);
-                auto &mwpm = enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm();
+                // A zero-row array is a no-op, exactly like edge_reweights=None
+                // and like decode_batch's treatment of empty/None rules --
+                // without this, the apply/restore transaction would run (and
+                // e.g. reject the no-op on negative-weight graphs).
+                has_reweights = !reweight_specs.empty();
             }
 
             try {
+                // Apply reweights INSIDE the try, so a throw anywhere after graph
+                // state is first touched -- including a Tier-2 regeneration inside
+                // apply_reweights -- reaches the catch block's restore. This used
+                // to sit before the try: a throwing regeneration then left the
+                // UserGraph permanently holding the per-shot weights (matching
+                // decode_batch, which has always kept its apply inside its try).
+                // apply_reweights materialises the graph itself; `mwpm` references
+                // the persistent _mwpm member, rebuilt in place, so it needs no
+                // re-binding.
+                if (has_reweights) {
+                    auto parsed = self.parse_reweight_specs(reweight_specs);
+                    bool regen = self.needs_regeneration(parsed);
+                    self.apply_reweights(std::move(parsed), regen, enable_correlations);
+                }
+
                 // Perform decoding
                 std::vector<uint64_t> detection_events_vec(
                     detection_events.data(), detection_events.data() + detection_events.size());
-                auto obs_crossed = new std::vector<uint8_t>(self.get_num_observables(), 0);
+                // Owned by a unique_ptr so an exception below (decode or restore) frees
+                // it rather than leaking; ownership is handed to the capsule on success.
+                auto obs_crossed = std::make_unique<std::vector<uint8_t>>(self.get_num_observables(), 0);
                 pm::total_weight_int weight = 0;
                 pm::decode_detection_events(mwpm, detection_events_vec, obs_crossed->data(), weight, enable_correlations);
                 double rescaled_weight = (double)weight / mwpm.flooder.graph.normalising_constant;
 
                 // Restore original weights if reweights were applied
                 if (has_reweights) {
-                    self.restore_weights(needs_regeneration);
+                    self.restore_weights();
                 }
 
-                auto err_capsule = py::capsule(obs_crossed, [](void *x) {
+                auto *obs_crossed_raw = obs_crossed.release();
+                auto err_capsule = py::capsule(obs_crossed_raw, [](void *x) {
                     delete reinterpret_cast<std::vector<uint8_t> *>(x);
                 });
                 py::array_t<uint8_t> obs_crossed_arr =
-                    py::array_t<uint8_t>(obs_crossed->size(), obs_crossed->data(), err_capsule);
+                    py::array_t<uint8_t>(obs_crossed_raw->size(), obs_crossed_raw->data(), err_capsule);
                 std::pair<py::array_t<std::uint8_t>, double> res = {obs_crossed_arr, rescaled_weight};
                 return res;
 
             } catch (...) {
-                // Ensure weights are restored even on exception
+                // Ensure weights are restored even on exception. restore_weights
+                // undoes with the tier recorded at apply time, and is a no-op if
+                // apply itself threw before committing.
                 if (has_reweights) {
-                    self.restore_weights(needs_regeneration);
+                    self.restore_weights();
                 }
                 throw;
             }
@@ -297,7 +328,7 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
            bool enable_correlations,
            py::object edge_reweights = py::none(),
            size_t reweight_stride = 1,
-           bool logical_error_if_no_matching = false) {
+           bool return_no_matching = false) {
             if (shots.ndim() != 2)
                 throw std::invalid_argument(
                     "`shots` array should have two dimensions, not " + std::to_string(shots.ndim()));
@@ -332,62 +363,107 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
             py::array_t<double> weights = py::array_t<double>(shots.shape(0));
             auto ws = weights.mutable_unchecked<1>();
 
+            // Per-shot flag: 1 where the shot had no perfect matching. Always allocated
+            // (like `weights`); the Python layer returns it only when requested.
+            py::array_t<uint8_t> no_matching = py::array_t<uint8_t>(shots.shape(0));
+            no_matching[py::make_tuple(py::ellipsis())] = 0;
+            auto nm = no_matching.mutable_unchecked<1>();
+
             auto &mwpm = enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm();
             std::vector<uint64_t> detection_events;
 
             // Handle edge reweights if provided - expect list of arrays for reweight rules
             bool has_reweights = !edge_reweights.is_none();
-            bool batch_needs_regeneration = false;
-            std::vector<std::vector<std::array<double, 3>>> all_reweight_specs;
+            // reweight_stride is used in the per-shot modulo below regardless of whether
+            // reweights were supplied, so validate it unconditionally: a stride of 0 would
+            // otherwise be an integer division by zero (a hard crash, not a Python error).
+            if (reweight_stride < 1)
+                throw std::invalid_argument(
+                    "reweight_stride must be a positive integer, got " + std::to_string(reweight_stride));
+            // Per-block regeneration decision, precomputed below against the
+            // unmutated graph. apply_reweights records the tier it applied, and
+            // restore_weights undoes with that recorded tier, so a block that
+            // mutates the UserGraph (Tier 2) is always undone by a matching
+            // Tier-2 restore -- including on the exception path.
+            std::vector<char> block_needs_regen;
+            std::vector<char> rule_has_reweights;
+            std::vector<std::vector<pm::EdgeReweight>> all_parsed_reweights;
 
             if (has_reweights) {
-                // Validate stride parameter
-                if (reweight_stride < 1) {
-                    throw std::invalid_argument(
-                        "reweight_stride must be a positive integer, got " + std::to_string(reweight_stride));
-                }
-
                 py::list reweights_list = edge_reweights.cast<py::list>();
                 size_t num_rules = reweights_list.size();
                 size_t num_shots = shots.shape(0);
 
-                // Validate stride × num_rules == num_shots
-                if (reweight_stride * num_rules != num_shots) {
+                // Validate stride × num_rules == num_shots. Phrased with division so
+                // the check cannot wrap: the naive size_t multiply overflows mod 2^64
+                // for a huge stride, letting it pass validation while rule_idx
+                // (i / stride) then maps every shot to rule 0, silently ignoring the
+                // remaining rules.
+                if (num_rules == 0 ? num_shots != 0
+                                   : (num_shots % num_rules != 0 || reweight_stride != num_shots / num_rules)) {
                     throw std::invalid_argument(
                         "reweight_stride (" + std::to_string(reweight_stride) +
                         ") × number of reweight rules (" + std::to_string(num_rules) +
-                        ") = " + std::to_string(reweight_stride * num_rules) +
-                        ", but number of shots is " + std::to_string(num_shots) +
-                        ". These must be equal.");
+                        ") must equal the number of shots (" + std::to_string(num_shots) + ").");
                 }
 
-                all_reweight_specs.resize(num_rules);
+                all_parsed_reweights.resize(num_rules);
 
-                // Prepare all reweight specs (one per rule, not per shot)
+                // Parse and fully validate every rule up front (one per rule, not
+                // per shot), so a malformed rule surfaces before ANY shot is
+                // decoded rather than mid-batch at its block's apply. The parsed
+                // entries capture each edge's current weight; they remain valid at
+                // every block's apply because Tier-2 restores write the original
+                // floats back bit-exactly between blocks.
                 for (py::ssize_t rule = 0; rule < reweights_list.size(); rule++) {
                     py::object rule_reweights_obj = reweights_list[rule];
 
                     // Handle None values - skip rules without reweights
                     if (rule_reweights_obj.is_none()) {
-                        // Leave all_reweight_specs[rule] empty (already initialized as empty vector)
+                        // Leave all_parsed_reweights[rule] empty (already initialized as empty vector)
                         continue;
                     }
 
                     py::array_t<double> rule_reweights = rule_reweights_obj.cast<py::array_t<double>>();
+                    validate_reweights_array(rule_reweights);
                     auto reweights_unchecked = rule_reweights.unchecked<2>();
 
+                    std::vector<std::array<double, 3>> raw_specs;
+                    raw_specs.reserve(reweights_unchecked.shape(0));
                     for (py::ssize_t j = 0; j < reweights_unchecked.shape(0); j++) {
-                        std::array<double, 3> spec = {
+                        raw_specs.push_back({
                             reweights_unchecked(j, 0),
                             reweights_unchecked(j, 1),
                             reweights_unchecked(j, 2)
-                        };
-                        all_reweight_specs[rule].push_back(spec);
+                        });
                     }
+                    all_parsed_reweights[rule] = self.parse_reweight_specs(raw_specs);
                 }
 
-                // Determine if batch needs regeneration
-                batch_needs_regeneration = self.batch_needs_regeneration(all_reweight_specs);
+                // Decide, per block, whether it needs regeneration (i.e. some reweight
+                // exceeds the original max weight). Computed here, before any reweight
+                // mutates the graph, so apply and restore agree on the tier for a block.
+                //
+                // TODO(perf): a block whose reweights exceed the max weight regenerates
+                // the whole matching graph on both apply and restore (2 rebuilds/block).
+                // This is correct but slow if many blocks are out-of-range. The intended
+                // optimisation is to regenerate ONCE per batch using a normalisation
+                // sized for the global batch max, run every block via Tier-1 direct
+                // updates against that fixed normalisation, then regenerate back once.
+                // That needs the normalising constant to be parameterisable by an
+                // externally supplied max (not currently exposed). In-range reweights
+                // (all Tier-1, including all erasure) are unaffected and stay fast.
+                block_needs_regen.assign(num_rules, 0);
+                // rule_has_reweights is recorded BEFORE the decode loop because a
+                // block's apply MOVES its parsed vector into the UserGraph,
+                // leaving all_parsed_reweights[r] empty -- the restore gate at the
+                // block's last shot must not read the moved-from vector.
+                rule_has_reweights.assign(num_rules, 0);
+                for (size_t r = 0; r < num_rules; r++) {
+                    rule_has_reweights[r] = all_parsed_reweights[r].empty() ? 0 : 1;
+                    if (rule_has_reweights[r])
+                        block_needs_regen[r] = self.needs_regeneration(all_parsed_reweights[r]) ? 1 : 0;
+                }
             }
 
             // Vector used to extract predicted observables when decoding if bit_packed_predictions is true
@@ -405,12 +481,16 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                     bool is_first_shot_in_block = (i % reweight_stride == 0);
                     bool is_last_shot_in_block = ((i + 1) % reweight_stride == 0) || (i == s.shape(0) - 1);
 
-                    // Apply reweights only at the start of each block
-                    if (has_reweights && is_first_shot_in_block && !all_reweight_specs[rule_idx].empty()) {
-                        // Regeneration on first rule if needed
-                        bool needs_regeneration = (rule_idx == 0 && batch_needs_regeneration);
-                        self.apply_reweights(all_reweight_specs[rule_idx], mwpm, needs_regeneration);
-                        auto &mwpm = enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm();
+                    // Apply reweights only at the start of each block.
+                    // apply_reweights materialises the graph itself (both any
+                    // regeneration pending from a previous block's Tier-2 restore
+                    // and this block's own Tier-2 apply), so no get_mwpm() refresh
+                    // is needed here or per shot. `mwpm` is a reference to the
+                    // persistent _mwpm member, so it reflects rebuilt graphs.
+                    if (has_reweights && is_first_shot_in_block && rule_has_reweights[rule_idx]) {
+                        self.apply_reweights(
+                            std::move(all_parsed_reweights[rule_idx]), block_needs_regen[rule_idx],
+                            enable_correlations);
                     }
 
                     // Extract detection events for this shot
@@ -450,32 +530,49 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                                 enable_correlations);
                         }
                         ws(i) = (double)solution_weight / mwpm.flooder.graph.normalising_constant;
-                    } catch (const std::invalid_argument&) {
-                        if (!logical_error_if_no_matching) throw;
-                        // No perfect matching found — force logical error by setting all
-                        // observable prediction bits to 1. XOR with actual observable flips
-                        // will be nonzero (the unused high bits guarantee this).
-                        memset(predictions_ptr + (num_observable_bytes * i), 0xFF, num_observable_bytes);
-                        ws(i) = 0.0;
+                    } catch (const pm::NoPerfectMatchingError&) {
+                        // Only this specific condition is handled here -- other input errors
+                        // (e.g. an out-of-range detector index) still propagate. Re-raise
+                        // unless the caller opted into flagging via return_no_matching.
+                        if (!return_no_matching) throw;
+                        nm(i) = 1;
+                        // Predict every observable flipped so the shot registers as a logical
+                        // error for callers that only inspect predictions. Honour the format:
+                        // one byte per observable (value 1) unpacked, or the low
+                        // num_observables bits when packed (never 0xFF, which emits non-binary
+                        // 255s and sets garbage high bits).
+                        uint8_t *pred = predictions_ptr + (num_observable_bytes * i);
+                        if (bit_packed_predictions) {
+                            for (size_t k = 0; k < self.get_num_observables(); k++)
+                                pred[k >> 3] |= (uint8_t)(1 << (k & 7));
+                        } else {
+                            std::memset(pred, 1, num_observable_bytes);
+                        }
+                        // No valid solution exists: report infinite weight, not 0.0 (which is a
+                        // real, perfect decode).
+                        ws(i) = std::numeric_limits<double>::infinity();
                     }
                     detection_events.clear();
 
-                    // Restore weights only at the end of each block
-                    if (has_reweights && is_last_shot_in_block && !all_reweight_specs[rule_idx].empty()) {
-                        // Use batch_needs_regeneration only for the last rule
-                        bool is_last_rule = (rule_idx == all_reweight_specs.size() - 1);
-                        bool needs_regeneration = is_last_rule ? batch_needs_regeneration : false;
-                        self.restore_weights(needs_regeneration);
+                    // Restore weights only at the end of each block. restore_weights
+                    // undoes with the tier recorded at apply time, so a Tier-2 apply
+                    // (which mutated the UserGraph) is always undone by a Tier-2
+                    // restore, and it re-materialises the graph so the next block --
+                    // including one with no reweights -- sees the restored graph.
+                    if (has_reweights && is_last_shot_in_block && rule_has_reweights[rule_idx]) {
+                        self.restore_weights();
                     }
                 }
 
                 predictions.resize({(py::ssize_t)shots.shape(0), (py::ssize_t)num_observable_bytes});
-                return py::make_tuple(predictions, weights);
+                return py::make_tuple(predictions, weights, no_matching);
 
             } catch (...) {
-                // Ensure weights are restored even on exception (pass batch regeneration flag)
+                // Ensure weights are restored even on exception: restore_weights
+                // undoes the in-flight block with the tier recorded at apply time
+                // (no-op if no apply is outstanding).
                 if (has_reweights) {
-                    self.restore_weights(batch_needs_regeneration);
+                    self.restore_weights();
                 }
                 throw;
             }
@@ -486,7 +583,7 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
         "enable_correlations"_a = false,
         "edge_reweights"_a = py::none(),
         "reweight_stride"_a = 1,
-        "logical_error_if_no_matching"_a = false);
+        "return_no_matching"_a = false);
     g.def(
         "decode_to_matched_detection_events_dict",
         [](pm::UserGraph &self, const py::array_t<uint64_t> &detection_events) {

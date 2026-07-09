@@ -23,6 +23,27 @@ double bernoulli_xor(double p1, double p2) {
     return p1 * (1 - p2) + p2 * (1 - p1);
 }
 
+/// Returns the index of `node2` in `node1`'s neighbor list within `graph` (a
+/// matching or search graph; `node2 == SIZE_MAX` finds the boundary slot), or
+/// SIZE_MAX if the graph or slot is absent. Absence is not an error here,
+/// unlike the nodes' own index_of_neighbor. NOTE: only edges with a dedicated
+/// slot are addressable this way -- edges incident to a boundary NODE are
+/// stored as a nullptr boundary slot at the other endpoint (or dropped
+/// entirely), so needs_regeneration routes reweights of such edges through a
+/// full regeneration instead of this lookup.
+template <typename Graph>
+size_t find_neighbor_index_in_graph(const Graph& graph, size_t node1, size_t node2) {
+    if (node1 >= graph.nodes.size() || (node2 != SIZE_MAX && node2 >= graph.nodes.size()))
+        return SIZE_MAX;
+    const auto* target = node2 == SIZE_MAX ? nullptr : &graph.nodes[node2];
+    const auto& neighbors = graph.nodes[node1].neighbors;
+    for (size_t i = 0; i < neighbors.size(); i++) {
+        if (neighbors[i] == target)
+            return i;
+    }
+    return SIZE_MAX;
+}
+
 }  // namespace
 
 
@@ -104,7 +125,7 @@ void pm::UserGraph::merge_edge_or_boundary_edge(
 
         _mwpm_needs_updating = true;
         // Invalidate caches when edge weights change
-        invalidate_max_weight_cache();
+        invalidate_edge_stats();
         if (new_error_probability < 0 || new_error_probability > 1)
             _all_edges_have_error_probabilities = false;
     }
@@ -136,7 +157,7 @@ void pm::UserGraph::add_or_merge_edge(
         }
         _mwpm_needs_updating = true;
         // Invalidate caches when graph structure changes
-        invalidate_max_weight_cache();
+        invalidate_edge_stats();
         if (error_probability < 0 || error_probability > 1)
             _all_edges_have_error_probabilities = false;
     } else {
@@ -166,7 +187,7 @@ void pm::UserGraph::add_or_merge_boundary_edge(
         }
         _mwpm_needs_updating = true;
         // Invalidate caches when graph structure changes
-        invalidate_max_weight_cache();
+        invalidate_edge_stats();
         if (error_probability < 0 || error_probability > 1)
             _all_edges_have_error_probabilities = false;
     } else {
@@ -175,19 +196,16 @@ void pm::UserGraph::add_or_merge_boundary_edge(
 }
 
 pm::UserGraph::UserGraph()
-    : _num_observables(0), _mwpm_needs_updating(true), _all_edges_have_error_probabilities(true),
-      _edge_index_cache_valid(false), _cached_max_abs_weight(0), _max_weight_cache_valid(false) {
+    : _num_observables(0), _mwpm_needs_updating(true), _all_edges_have_error_probabilities(true) {
 }
 
 pm::UserGraph::UserGraph(size_t num_nodes)
-    : _num_observables(0), _mwpm_needs_updating(true), _all_edges_have_error_probabilities(true),
-      _edge_index_cache_valid(false), _cached_max_abs_weight(0), _max_weight_cache_valid(false) {
+    : _num_observables(0), _mwpm_needs_updating(true), _all_edges_have_error_probabilities(true) {
     nodes.resize(num_nodes);
 }
 
 pm::UserGraph::UserGraph(size_t num_nodes, size_t num_observables)
-    : _num_observables(num_observables), _mwpm_needs_updating(true), _all_edges_have_error_probabilities(true),
-      _edge_index_cache_valid(false), _cached_max_abs_weight(0), _max_weight_cache_valid(false) {
+    : _num_observables(num_observables), _mwpm_needs_updating(true), _all_edges_have_error_probabilities(true) {
     nodes.resize(num_nodes);
 }
 
@@ -264,33 +282,51 @@ bool pm::UserGraph::all_edges_have_error_probabilities() {
     return _all_edges_have_error_probabilities;
 }
 
-double pm::UserGraph::max_abs_weight() {
-    // Use cached value if available (Optimization 5)
-    if (_max_weight_cache_valid) {
-        return _cached_max_abs_weight;
+const pm::UserGraph::EdgeStats& pm::UserGraph::edge_stats() const {
+    // One traversal computes every per-edge aggregate the reweighting hot path
+    // needs. Crucially, max_abs_weight_incl_implied is the SAME maximum
+    // get_edge_weight_normalising_constant sizes the discretization by, and
+    // all_integral matches its integer-resolution collapse -- computing them in
+    // one place means the tier classifier and the discretization can never
+    // silently desynchronise. Cached because needs_regeneration runs per
+    // reweighted decode; an uncached O(E) list traversal measurably slows
+    // Tier-1 (e.g. +35us at E=26k for the previously-uncached integral scan).
+    if (_edge_stats.valid) {
+        return _edge_stats;
     }
-
-    double max_weight = 0;
-    for (auto& e : edges) {
-        if (std::abs(e.weight) > max_weight) {
-            max_weight = std::abs(e.weight);
+    EdgeStats stats;
+    for (const auto& e : edges) {
+        double abs_w = std::abs(e.weight);
+        if (abs_w > stats.max_abs_weight)
+            stats.max_abs_weight = abs_w;
+        if (e.weight < 0)
+            stats.has_negative_weight = true;
+        if (round(e.weight) != e.weight)
+            stats.all_integral = false;
+        for (const auto& implied : e.implied_weights_for_other_edges) {
+            double abs_iw = std::abs(implied.implied_weight);
+            if (abs_iw > stats.max_abs_weight_incl_implied)
+                stats.max_abs_weight_incl_implied = abs_iw;
+            if (round(implied.implied_weight) != implied.implied_weight)
+                stats.all_integral = false;
         }
     }
-
-    // Cache the result
-    _cached_max_abs_weight = max_weight;
-    _max_weight_cache_valid = true;
-
-    return max_weight;
+    stats.max_abs_weight_incl_implied = std::max(stats.max_abs_weight_incl_implied, stats.max_abs_weight);
+    stats.valid = true;
+    _edge_stats = stats;
+    return _edge_stats;
 }
 
-double pm::UserGraph::get_cached_max_abs_weight() {
-    return max_abs_weight();  // Uses caching internally
+double pm::UserGraph::max_abs_weight() {
+    return edge_stats().max_abs_weight;
 }
 
-void pm::UserGraph::invalidate_max_weight_cache() {
-    _max_weight_cache_valid = false;
-    _edge_index_cache_valid = false;  // Also invalidate edge index cache when graph changes
+double pm::UserGraph::max_abs_weight_including_implied() {
+    return edge_stats().max_abs_weight_incl_implied;
+}
+
+void pm::UserGraph::invalidate_edge_stats() {
+    _edge_stats.valid = false;
 }
 
 pm::MatchingGraph pm::UserGraph::to_matching_graph(pm::weight_int num_distinct_weights) {
@@ -448,25 +484,9 @@ void pm::UserGraph::set_min_num_observables(size_t num_observables) {
 }
 
 double pm::UserGraph::get_edge_weight_normalising_constant(size_t max_num_distinct_weights) {
-    double max_abs_weight = 0;
-    bool all_integral_weight = true;
+    // Validate implied-weight rewrite rules (edge existence, no sign change).
     for (auto& e : edges) {
-        if (std::abs(e.weight) > max_abs_weight)
-            max_abs_weight = std::abs(e.weight);
-
-        if (round(e.weight) != e.weight) {
-            all_integral_weight = false;
-        }
-
-        for (auto implied : e.implied_weights_for_other_edges) {
-            if (std::abs(implied.implied_weight) > max_abs_weight) {
-                max_abs_weight = std::abs(implied.implied_weight);
-            }
-
-            if (round(implied.implied_weight) != implied.implied_weight) {
-                all_integral_weight = false;
-            }
-
+        for (const auto& implied : e.implied_weights_for_other_edges) {
             double current_weight;
             bool has_edge = get_edge_or_boundary_edge_weight(implied.node1, implied.node2, current_weight);
             if (!has_edge) {
@@ -482,15 +502,20 @@ double pm::UserGraph::get_edge_weight_normalising_constant(size_t max_num_distin
         }
     }
 
-    if (max_abs_weight > pm::MAX_USER_EDGE_WEIGHT)
+    // Size the constant from the shared edge stats -- the SAME values
+    // needs_regeneration classifies tiers against, so the two cannot
+    // desynchronise.
+    const EdgeStats& stats = edge_stats();
+
+    if (stats.max_abs_weight_incl_implied > pm::MAX_USER_EDGE_WEIGHT)
         throw std::invalid_argument(
             "maximum absolute edge weight of " + std::to_string(pm::MAX_USER_EDGE_WEIGHT) + " exceeded.");
 
-    if (all_integral_weight) {
+    if (stats.all_integral) {
         return 1.0;
     } else {
         pm::weight_int max_half_edge_weight = max_num_distinct_weights - 1;
-        return (double)max_half_edge_weight / max_abs_weight;
+        return (double)max_half_edge_weight / stats.max_abs_weight_incl_implied;
     }
 }
 
@@ -544,148 +569,65 @@ pm::UserGraph pm::detector_error_model_to_user_graph(
     return user_graph;
 }
 
-// Optimization 1: Create a canonical key for edge lookup
-std::pair<size_t, size_t> pm::UserGraph::make_edge_key(size_t node1, size_t node2) {
-    // For boundary edges (node2 == SIZE_MAX), always put the real node first
-    if (node2 == SIZE_MAX) {
-        return {node1, SIZE_MAX};
-    }
-    // For regular edges, use min/max to ensure consistent ordering
-    return std::minmax(node1, node2);
-}
+std::vector<pm::EdgeReweight> pm::UserGraph::parse_reweight_specs(
+    const std::vector<std::array<double, 3>>& reweight_specs) {
+    // Parses into a local vector; the caller commits it via apply_reweights only
+    // after every spec has passed (strong exception guarantee). A throw part-way
+    // through leaves _active_reweights untouched: stale partial entries from a
+    // failed call would otherwise be replayed into the graph by a later
+    // exception-path restore_weights, silently overwriting weights the user set
+    // in the meantime.
+    std::vector<EdgeReweight> validated;
+    validated.reserve(reweight_specs.size());
 
-// Optimization 1: Build the edge index cache
-void pm::UserGraph::build_edge_index_cache(pm::Mwpm& mwpm) {
-    _edge_index_cache.clear();
-
-    // Iterate through all edges in the UserGraph
-    for (size_t node_idx = 0; node_idx < nodes.size(); node_idx++) {
-        for (size_t neighbor_idx = 0; neighbor_idx < nodes[node_idx].neighbors.size(); neighbor_idx++) {
-            const auto& neighbor = nodes[node_idx].neighbors[neighbor_idx];
-            size_t other_node;
-            if (neighbor.pos == 0) {
-                other_node = neighbor.edge_it->node1;
-            } else {
-                other_node = neighbor.edge_it->node2;
-            }
-
-            auto key = make_edge_key(node_idx, other_node);
-
-            // Only process each edge once (when node_idx is the smaller node, or for boundary edges)
-            if (key.first != node_idx && other_node != SIZE_MAX) {
-                continue;
-            }
-
-            EdgeIndexCache cache;
-            cache.user_graph_neighbor_idx = neighbor_idx;
-
-            // Find matching graph indices
-            cache.matching_graph_node1_neighbor_idx = find_neighbor_index_in_matching_graph(key.first, key.second);
-            if (key.second != SIZE_MAX) {
-                cache.matching_graph_node2_neighbor_idx = find_neighbor_index_in_matching_graph(key.second, key.first);
-            } else {
-                cache.matching_graph_node2_neighbor_idx = SIZE_MAX;
-            }
-
-            // Find search graph indices (if search graph exists)
-            if (mwpm.search_flooder.graph.nodes.size() > 0) {
-                cache.search_graph_node1_neighbor_idx = find_neighbor_index_in_search_graph(key.first, key.second);
-                if (key.second != SIZE_MAX) {
-                    cache.search_graph_node2_neighbor_idx = find_neighbor_index_in_search_graph(key.second, key.first);
-                } else {
-                    cache.search_graph_node2_neighbor_idx = SIZE_MAX;
-                }
-            } else {
-                cache.search_graph_node1_neighbor_idx = SIZE_MAX;
-                cache.search_graph_node2_neighbor_idx = SIZE_MAX;
-            }
-
-            _edge_index_cache[key] = cache;
-        }
-    }
-
-    _edge_index_cache_valid = true;
-}
-
-// Optimization 1: Get or create cached edge indices
-const pm::EdgeIndexCache* pm::UserGraph::get_edge_index_cache(size_t node1, size_t node2, pm::Mwpm& mwpm) {
-    // Build cache if not valid
-    if (!_edge_index_cache_valid) {
-        build_edge_index_cache(mwpm);
-    }
-
-    auto key = make_edge_key(node1, node2);
-    auto it = _edge_index_cache.find(key);
-    if (it != _edge_index_cache.end()) {
-        return &it->second;
-    }
-    return nullptr;
-}
-
-// Optimization 4: Prepare batch reweights
-void pm::UserGraph::prepare_batch_reweights(const std::vector<std::vector<std::array<double, 3>>>& all_reweight_specs, pm::Mwpm& mwpm) {
-    // Build edge index cache if not already built
-    if (!_edge_index_cache_valid) {
-        build_edge_index_cache(mwpm);
-    }
-
-    // Pre-validate all unique edges across the batch
-    std::unordered_map<std::pair<size_t, size_t>, bool, PairHash> validated_edges;
-
-    for (const auto& shot_specs : all_reweight_specs) {
-        for (const auto& spec : shot_specs) {
-            size_t node1 = (size_t)spec[0];
-            double node2_raw = spec[1];
-            size_t node2 = (node2_raw < 0) ? SIZE_MAX : (size_t)node2_raw;
-
-            auto key = make_edge_key(node1, node2);
-            if (validated_edges.find(key) == validated_edges.end()) {
-                // Validate this edge exists
-                double original_weight;
-                if (!get_edge_or_boundary_edge_weight(node1, node2, original_weight)) {
-                    std::string node2_str = (node2 == SIZE_MAX) ? "-1" : std::to_string(node2);
-                    throw std::invalid_argument("Edge (" + std::to_string(node1) + ", " +
-                                              node2_str + ") does not exist");
-                }
-                validated_edges[key] = true;
-            }
-        }
-    }
-}
-
-void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& reweight_specs, pm::Mwpm& mwpm, bool needs_regeneration) {
-    // Check graph has no negative weights
-    if (!mwpm.flooder.negative_weight_detection_events.empty()) {
-        throw std::invalid_argument("Edge reweighting not supported with negative edge weights");
-    }
-
-    // Optimization 3: Reuse the reweight buffer to avoid heap allocations
-    _reweight_buffer.clear();
-    if (_reweight_buffer.capacity() < reweight_specs.size()) {
-        _reweight_buffer.reserve(reweight_specs.size() * 2);  // Amortized growth
-    }
-
-    // Validate and prepare reweights
     for (const auto& spec : reweight_specs) {
+        // Node indices arrive as user-supplied doubles; ensure the value is safely
+        // castable BEFORE any cast. Casting a negative, non-finite, non-integral,
+        // or too-large double to size_t is undefined behaviour and silently
+        // "succeeds" with garbage on most platforms (e.g. on arm64 NaN converts to
+        // node 0, 1e30 saturates to SIZE_MAX -- the boundary sentinel -- and 2.7
+        // truncates to node 2), reweighting the wrong edge with no error. The
+        // bound is derived from the platform: (double)SIZE_MAX rounds UP to 2^64
+        // on 64-bit size_t (the exact boundary for defined casts) and is exactly
+        // representable on 32-bit, where it also rejects the SIZE_MAX boundary
+        // sentinel itself. In-range but nonexistent nodes fall through to the
+        // "Edge does not exist" check below, preserving the pre-existing error.
+        auto validate_node_index = [](double v, const char* which) {
+            if (!std::isfinite(v) || v < 0 || round(v) != v || v >= (double)SIZE_MAX)
+                throw std::invalid_argument(
+                    std::string("Reweight ") + which + " must be a finite non-negative integer, got " +
+                    std::to_string(v));
+        };
+        validate_node_index(spec[0], "node1");
         size_t node1 = (size_t)spec[0];
         double node2_raw = spec[1];
         size_t node2;
 
-        // Validate boundary edge format first
-        if (node2_raw < 0) {
-            if (node2_raw != -1.0) {
-                throw std::invalid_argument("Boundary edges must use exactly -1 as second node");
-            }
+        // Exactly -1 is the boundary sentinel; other FINITE negatives get the
+        // boundary-format error; everything else (including NaN and +/-inf) goes
+        // through validate_node_index for the castability diagnostic.
+        if (node2_raw == -1.0) {
             node2 = SIZE_MAX;
+        } else if (std::isfinite(node2_raw) && node2_raw < 0) {
+            throw std::invalid_argument("Boundary edges must use exactly -1 as second node");
         } else {
+            validate_node_index(node2_raw, "node2");
             node2 = (size_t)node2_raw;
         }
 
         double new_weight = spec[2];
 
-        // Validate new weight is non-negative
-        if (new_weight < 0) {
-            throw std::invalid_argument("Reweight values must be non-negative");
+        // Reject negative, non-finite, and over-max weights before any state is
+        // touched. NaN would otherwise pass a plain `< 0` check and reach an
+        // out-of-range double->weight_int cast (UB) in the Tier-1 discretization;
+        // weights above MAX_USER_EDGE_WEIGHT would throw later, mid-regeneration.
+        if (new_weight < 0 || !std::isfinite(new_weight)) {
+            throw std::invalid_argument("Reweight values must be finite and non-negative");
+        }
+        if (new_weight > pm::MAX_USER_EDGE_WEIGHT) {
+            throw std::invalid_argument(
+                "Reweight value " + std::to_string(new_weight) + " exceeds the maximum edge weight " +
+                std::to_string(pm::MAX_USER_EDGE_WEIGHT));
         }
 
         // Find existing edge and store original weight
@@ -702,38 +644,69 @@ void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& re
         reweight.original_weight = original_weight;
         reweight.new_weight = new_weight;
 
-        // Optimization 1: Use cached edge indices if available
-        const EdgeIndexCache* cache = get_edge_index_cache(node1, node2, mwpm);
-        if (cache != nullptr) {
-            // Determine which indices to use based on node ordering
-            auto key = make_edge_key(node1, node2);
-            if (key.first == node1) {
-                reweight.matching_graph_node1_neighbor_idx = cache->matching_graph_node1_neighbor_idx;
-                reweight.matching_graph_node2_neighbor_idx = cache->matching_graph_node2_neighbor_idx;
-                reweight.search_graph_node1_neighbor_idx = cache->search_graph_node1_neighbor_idx;
-                reweight.search_graph_node2_neighbor_idx = cache->search_graph_node2_neighbor_idx;
-            } else {
-                // Swap indices since node1/node2 are reversed from the cache key
-                reweight.matching_graph_node1_neighbor_idx = cache->matching_graph_node2_neighbor_idx;
-                reweight.matching_graph_node2_neighbor_idx = cache->matching_graph_node1_neighbor_idx;
-                reweight.search_graph_node1_neighbor_idx = cache->search_graph_node2_neighbor_idx;
-                reweight.search_graph_node2_neighbor_idx = cache->search_graph_node1_neighbor_idx;
-            }
-        } else {
-            // Fallback: indices will be computed lazily
-            reweight.matching_graph_node1_neighbor_idx = SIZE_MAX;
-            reweight.matching_graph_node2_neighbor_idx = SIZE_MAX;
-            reweight.search_graph_node1_neighbor_idx = SIZE_MAX;
-            reweight.search_graph_node2_neighbor_idx = SIZE_MAX;
-        }
+        // Neighbor indices are computed in the Tier-1 branch below
+        // (the O(degree) lookup is negligible next to a decode).
+        reweight.matching_graph_node1_neighbor_idx = SIZE_MAX;
+        reweight.matching_graph_node2_neighbor_idx = SIZE_MAX;
+        reweight.search_graph_node1_neighbor_idx = SIZE_MAX;
+        reweight.search_graph_node2_neighbor_idx = SIZE_MAX;
         reweight.original_normalized_weight = 0;
-        reweight.new_normalized_weight = 0;
 
-        _reweight_buffer.push_back(reweight);
+        validated.push_back(reweight);
     }
 
-    // Move buffer to active reweights (avoids copy)
-    _active_reweights = std::move(_reweight_buffer);
+    return validated;
+}
+
+void pm::UserGraph::apply_reweights(
+    std::vector<EdgeReweight>&& parsed_reweights, bool needs_regeneration, bool ensure_search_graph) {
+    // Defensive: applying while a previous apply is still outstanding would
+    // silently discard its snapshots and bake its Tier-1 writes into the graph.
+    // Unreachable through the pybind callers, which pair every apply with a
+    // restore on both the success and exception paths.
+    if (!_active_reweights.empty()) {
+        throw std::logic_error("apply_reweights called with reweights already applied (missing restore_weights)");
+    }
+
+    // Reject reweighting on graphs with any negative edge weight: the matching
+    // graph stores abs(weight) in the slot plus baked-in compensation (virtual
+    // detection events, pre-flipped observables, negative_weight_sum) that an
+    // in-place Tier-1 write cannot maintain. The check reads the UserGraph FLOAT
+    // weights, so it is uniform: it cannot be parity-cancelled by cycles of
+    // negative edges (the old detection-events check) and does not depend on
+    // whether a tiny negative weight happens to discretize to 0 (the discretized
+    // negative_weight_sum). Checked before materialising, so a rejected call
+    // does no graph work.
+    if (edge_stats().has_negative_weight) {
+        throw std::invalid_argument("Edge reweighting not supported with negative edge weights");
+    }
+
+    // Materialise the graph in the requested shape before touching anything, so
+    // any regeneration still pending (e.g. from a previous Tier-2 restore or a
+    // graph mutation) is applied and the Tier-1 snapshots below target the
+    // up-to-date graph. O(1) when nothing is pending.
+    pm::Mwpm& mwpm = ensure_search_graph ? get_mwpm_with_search_graph() : get_mwpm();
+
+    // Preserve an already-present search graph across Tier-2 rebuilds even when
+    // this decode doesn't need it: rebuilding without it would force the next
+    // correlations consumer (decode_to_edges_array, shortest-path queries) to pay
+    // a full rebuild, ping-ponging shapes on mixed workloads. This shape is also
+    // recorded at commit time so restore re-materialises in the shape THIS apply
+    // established, rather than probing.
+    bool with_search_graph = ensure_search_graph ||
+        (mwpm.flooder.graph.nodes.size() > 0 &&
+         mwpm.search_flooder.graph.nodes.size() == mwpm.flooder.graph.nodes.size());
+
+    // Commit, recording the tier so restore_weights can only ever undo with the
+    // tier that was applied. Nothing above mutated reweight state, so a throw
+    // from the guard leaves _active_reweights untouched (strong guarantee,
+    // paired with parse_reweight_specs validating before anything is committed).
+    // From here on nothing throws before the apply completes (Tier-1 writes
+    // discretized ints; Tier-2 writes UserGraph floats for edges the parse just
+    // resolved).
+    _active_reweights = std::move(parsed_reweights);
+    _active_reweights_regen = needs_regeneration;
+    _active_reweights_with_search = with_search_graph;
 
     if (needs_regeneration) {
         // Full regeneration - need to update UserGraph edges
@@ -742,29 +715,65 @@ void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& re
             nodes[rw.node1].neighbors[neighbor_idx].edge_it->weight = rw.new_weight;
         }
         _mwpm_needs_updating = true;
+        // UserGraph edge weights changed, so the cached edge stats are stale.
+        invalidate_edge_stats();
+        // Materialise the regeneration now, in the recorded shape, so callers
+        // decode against the reweighted graph without needing a get_mwpm()
+        // refresh (and without dropping a search graph a previous caller built).
+        (void)(with_search_graph ? get_mwpm_with_search_graph() : get_mwpm());
     } else {
-        // Optimization 2: Skip UserGraph updates in Tier 1 mode
-        // Note: edges() will return original weights during reweighted decode
-        // This is documented behavior for performance optimization
+        // Tier 1: leave the UserGraph untouched; only the discretized slots in
+        // the existing matching/search graphs change (so edges() keeps returning
+        // the original weights, and no regeneration is scheduled).
 
-        // Direct graph weight updates
-        // Calculate normalized weights using the mwpm's normalization constant
+        // Locate every discretized-weight slot for each reweighted edge and
+        // snapshot the value it currently holds, so restore_weights can write it
+        // back verbatim rather than re-deriving it (which risked mismatching the
+        // build-time discretization).
+        const auto& matching_graph = _mwpm.flooder.graph;
+        const auto& search_graph = _mwpm.search_flooder.graph;
         for (auto& rw : _active_reweights) {
-            rw.original_normalized_weight = (weight_int)round(rw.original_weight * mwpm.flooder.graph.normalising_constant) * 2;
-            rw.new_normalized_weight = (weight_int)round(rw.new_weight * mwpm.flooder.graph.normalising_constant) * 2;
+            rw.matching_graph_node1_neighbor_idx = find_neighbor_index_in_graph(matching_graph, rw.node1, rw.node2);
+            rw.search_graph_node1_neighbor_idx = find_neighbor_index_in_graph(search_graph, rw.node1, rw.node2);
+            if (rw.node2 != SIZE_MAX) {
+                rw.matching_graph_node2_neighbor_idx = find_neighbor_index_in_graph(matching_graph, rw.node2, rw.node1);
+                rw.search_graph_node2_neighbor_idx = find_neighbor_index_in_graph(search_graph, rw.node2, rw.node1);
+            }
+            // The matching and search graphs are built from the same UserGraph by
+            // the same helper, so a slot present in one is present in the other:
+            // one snapshot suffices. A SIZE_MAX index here means the edge has no
+            // slot in either graph (a self-loop, dropped at build time), making
+            // the reweight a no-op in both tiers.
+            if (rw.matching_graph_node1_neighbor_idx != SIZE_MAX) {
+                rw.original_normalized_weight =
+                    _mwpm.flooder.graph.nodes[rw.node1].neighbor_weights[rw.matching_graph_node1_neighbor_idx];
+            }
         }
 
-        // Update weights directly in existing graphs
-        update_existing_graph_weights();
+        // Write the new weights only after every snapshot is taken, so duplicate
+        // reweights of the same edge in one call snapshot the true original.
+        // NOTE: graph.normalising_constant already has the factor of 2 baked in
+        // (see iter_discretized_edges, which returns `normalising_constant * 2`).
+        // Build-time discretization is `round(weight * nc_base) * 2` where
+        // nc_base == graph.normalising_constant / 2, so we must divide by 2 inside
+        // the round() to match it. Multiplying by graph.normalising_constant and
+        // then by 2 would apply the factor of 2 twice, doubling every reweighted
+        // edge's integer weight.
+        double nc = mwpm.flooder.graph.normalising_constant;
+        for (const auto& rw : _active_reweights) {
+            write_reweight_slots(rw, (weight_int)round(rw.new_weight * nc / 2) * 2);
+        }
 
         // DO NOT set _mwpm_needs_updating = true
     }
 }
 
-void pm::UserGraph::restore_weights(bool needs_regeneration) {
+void pm::UserGraph::restore_weights() {
     if (_active_reweights.empty()) return;
+    bool regen = _active_reweights_regen;
+    bool with_search = _active_reweights_with_search;
 
-    if (needs_regeneration) {
+    if (regen) {
         // Full regeneration path - need to restore UserGraph edges
         for (const auto& rw : _active_reweights) {
             size_t neighbor_idx = nodes[rw.node1].index_of_neighbor(rw.node2);
@@ -772,170 +781,132 @@ void pm::UserGraph::restore_weights(bool needs_regeneration) {
         }
         // Trigger regeneration to restore original normalization
         _mwpm_needs_updating = true;
+        // UserGraph edge weights changed, so the cached edge stats are stale.
+        invalidate_edge_stats();
     } else {
-        // Optimization 2: Skip UserGraph restoration in Tier 1 mode
-        // UserGraph was never modified, so no need to restore it
-        // Only restore weights directly in existing graphs
-
-        // Restore MatchingGraph weights
-        if (_mwpm.flooder.graph.nodes.size() > 0) {
-            for (const auto& rw : _active_reweights) {
-                if (rw.matching_graph_node1_neighbor_idx != SIZE_MAX) {
-                    _mwpm.flooder.graph.nodes[rw.node1].neighbor_weights[rw.matching_graph_node1_neighbor_idx] =
-                        rw.original_normalized_weight;
-                }
-                if (rw.node2 != SIZE_MAX && rw.matching_graph_node2_neighbor_idx != SIZE_MAX) {
-                    _mwpm.flooder.graph.nodes[rw.node2].neighbor_weights[rw.matching_graph_node2_neighbor_idx] =
-                        rw.original_normalized_weight;
-                }
-            }
-        }
-
-        // Restore SearchGraph weights
-        if (_mwpm.search_flooder.graph.nodes.size() > 0) {
-            for (const auto& rw : _active_reweights) {
-                if (rw.search_graph_node1_neighbor_idx != SIZE_MAX) {
-                    _mwpm.search_flooder.graph.nodes[rw.node1].neighbor_weights[rw.search_graph_node1_neighbor_idx] =
-                        rw.original_normalized_weight;
-                }
-                if (rw.node2 != SIZE_MAX && rw.search_graph_node2_neighbor_idx != SIZE_MAX) {
-                    _mwpm.search_flooder.graph.nodes[rw.node2].neighbor_weights[rw.search_graph_node2_neighbor_idx] =
-                        rw.original_normalized_weight;
-                }
-            }
+        // Tier 1: the UserGraph was never modified, so only the discretized
+        // slots are restored -- the snapshots are written back verbatim.
+        for (const auto& rw : _active_reweights) {
+            write_reweight_slots(rw, rw.original_normalized_weight);
         }
 
         // DO NOT set _mwpm_needs_updating = true
     }
 
-    // Reset state
+    // Reset state BEFORE materialising: the graph is fully restored at this
+    // point, so even if the rebuild below throws (e.g. bad_alloc), a repeated
+    // restore is a clean no-op rather than a replay.
     _active_reweights.clear();
-}
+    _active_reweights_regen = false;
+    _active_reweights_with_search = false;
 
-bool pm::UserGraph::needs_regeneration(const std::vector<std::array<double, 3>>& reweight_specs) {
-    double original_max_abs_weight = max_abs_weight();
-    double max_abs_weight = original_max_abs_weight;
-
-    // Find maximum weight among the reweight specifications
-    for (const auto& spec : reweight_specs) {
-        double new_weight = spec[2];
-        max_abs_weight = std::max(max_abs_weight, std::abs(new_weight));
-    }
-
-    return max_abs_weight > original_max_abs_weight;
-}
-
-bool pm::UserGraph::batch_needs_regeneration(const std::vector<std::vector<std::array<double, 3>>>& all_reweight_specs) {
-    double original_max_abs_weight = max_abs_weight();
-    double global_max_abs_weight = original_max_abs_weight;
-
-    // Find global maximum weight across all shots
-    for (const auto& shot_reweights : all_reweight_specs) {
-        for (const auto& spec : shot_reweights) {
-            double new_weight = spec[2];
-            global_max_abs_weight = std::max(global_max_abs_weight, std::abs(new_weight));
-        }
-    }
-
-    return global_max_abs_weight > original_max_abs_weight;
-}
-
-void pm::UserGraph::update_existing_graph_weights() {
-    // Update MatchingGraph weights
-    if (_mwpm.flooder.graph.nodes.size() > 0) {
-        for (auto& rw : _active_reweights) {
-            // Find neighbor indices if not already found
-            if (rw.matching_graph_node1_neighbor_idx == SIZE_MAX) {
-                rw.matching_graph_node1_neighbor_idx = find_neighbor_index_in_matching_graph(rw.node1, rw.node2);
-            }
-            if (rw.node2 != SIZE_MAX && rw.matching_graph_node2_neighbor_idx == SIZE_MAX) {
-                rw.matching_graph_node2_neighbor_idx = find_neighbor_index_in_matching_graph(rw.node2, rw.node1);
-            }
-
-            // Update forward edge (node1 -> node2)
-            if (rw.matching_graph_node1_neighbor_idx != SIZE_MAX) {
-                _mwpm.flooder.graph.nodes[rw.node1].neighbor_weights[rw.matching_graph_node1_neighbor_idx] =
-                    rw.new_normalized_weight;
-            }
-
-            // Update reverse edge (node2 -> node1) if not boundary edge
-            if (rw.node2 != SIZE_MAX && rw.matching_graph_node2_neighbor_idx != SIZE_MAX) {
-                _mwpm.flooder.graph.nodes[rw.node2].neighbor_weights[rw.matching_graph_node2_neighbor_idx] =
-                    rw.new_normalized_weight;
-            }
-        }
-    }
-
-    // Update SearchGraph weights (if it exists)
-    if (_mwpm.search_flooder.graph.nodes.size() > 0) {
-        for (auto& rw : _active_reweights) {
-            // Find neighbor indices if not already found
-            if (rw.search_graph_node1_neighbor_idx == SIZE_MAX) {
-                rw.search_graph_node1_neighbor_idx = find_neighbor_index_in_search_graph(rw.node1, rw.node2);
-            }
-            if (rw.node2 != SIZE_MAX && rw.search_graph_node2_neighbor_idx == SIZE_MAX) {
-                rw.search_graph_node2_neighbor_idx = find_neighbor_index_in_search_graph(rw.node2, rw.node1);
-            }
-
-            // Update forward edge (node1 -> node2)
-            if (rw.search_graph_node1_neighbor_idx != SIZE_MAX) {
-                _mwpm.search_flooder.graph.nodes[rw.node1].neighbor_weights[rw.search_graph_node1_neighbor_idx] =
-                    rw.new_normalized_weight;
-            }
-
-            // Update reverse edge (node2 -> node1) if not boundary edge
-            if (rw.node2 != SIZE_MAX && rw.search_graph_node2_neighbor_idx != SIZE_MAX) {
-                _mwpm.search_flooder.graph.nodes[rw.node2].neighbor_weights[rw.search_graph_node2_neighbor_idx] =
-                    rw.new_normalized_weight;
-            }
+    if (regen) {
+        // Materialise the regeneration back to the original graph, in the shape
+        // recorded at apply time, so a following block or decode -- including
+        // one that applies no reweights -- sees the restored graph without
+        // needing a get_mwpm() refresh. This is purely a cache warm: the graph
+        // state is already fully restored and _mwpm_needs_updating is set, so if
+        // the rebuild fails (e.g. bad_alloc) we swallow the error -- the lazy
+        // flag remains and the next decode materialises on demand. Propagating
+        // it would mask the caller's original error when restore runs from a
+        // catch handler, or discard a completed decode's result on the success
+        // path.
+        try {
+            (void)(with_search ? get_mwpm_with_search_graph() : get_mwpm());
+        } catch (...) {
         }
     }
 }
 
-size_t pm::UserGraph::find_neighbor_index_in_matching_graph(size_t node1, size_t node2) {
-    if (node1 >= _mwpm.flooder.graph.nodes.size()) {
-        return SIZE_MAX;
-    }
+bool pm::UserGraph::all_edges_integral() const {
+    return edge_stats().all_integral;
+}
 
-    const auto& neighbors = _mwpm.flooder.graph.nodes[node1].neighbors;
-    for (size_t i = 0; i < neighbors.size(); i++) {
-        if (node2 == SIZE_MAX) {
-            // Looking for boundary edge
-            if (neighbors[i] == nullptr) {
-                return i;
-            }
+bool pm::UserGraph::needs_regeneration(const std::vector<EdgeReweight>& parsed_reweights) {
+    // Compare against the SAME maximum the normalising constant is sized by:
+    // get_edge_weight_normalising_constant takes the max over edges AND implied
+    // correlation weights. Using the edge-only max would needlessly classify
+    // reweights in (edge_max, implied_max] as Tier-2 (two full rebuilds per
+    // decode) even though an in-place write at the actual constant is exact.
+    // NOTE: for positively-correlated decomposed DEMs the implied conditional
+    // probabilities are >= the marginals, so implied weights are <= edge
+    // weights and that band is empty in practice -- this comparison is chosen
+    // for definitional consistency with the constant, not observed behavior.
+    double original_max_abs_weight = max_abs_weight_including_implied();
+    double max_new_abs_weight = original_max_abs_weight;
+
+    // When the current graph is all-integral, get_edge_weight_normalising_constant
+    // collapses to 1.0, so the matching graph is discretized at integer resolution.
+    // An in-place (Tier-1) reweight to a non-integer value would then be silently
+    // rounded to the nearest integer (e.g. 0.1 -> a free edge). Force a full
+    // regeneration in that case: the reweighted, now non-integral edge makes
+    // all_integral_weight false, rescaling the constant to fine resolution.
+    bool graph_all_integral = all_edges_integral();
+
+    // Returns true iff node u has an edge to a boundary NODE (as opposed to the
+    // virtual boundary): such edges min-merge with u's explicit boundary edge
+    // into a single discretized boundary slot at build time.
+    auto has_boundary_node_neighbor = [&](size_t u) {
+        for (const auto& neighbor : nodes[u].neighbors) {
+            size_t other = neighbor.pos == 0 ? neighbor.edge_it->node1 : neighbor.edge_it->node2;
+            if (other != SIZE_MAX && nodes[other].is_boundary)
+                return true;
+        }
+        return false;
+    };
+
+    for (const auto& rw : parsed_reweights) {
+        if (graph_all_integral && round(rw.new_weight) != rw.new_weight)
+            return true;
+        // Regeneration is also required when a reweight exceeds the original max,
+        // which changes the normalising constant.
+        max_new_abs_weight = std::max(max_new_abs_weight, std::abs(rw.new_weight));
+
+        // Slot-ambiguity rules: force regeneration when the spec touches an edge
+        // with no dedicated in-place slot, where a Tier-1 write would silently
+        // no-op or corrupt shared state. Regeneration re-derives the discretized
+        // graph from the UserGraph (including boundary min-merging), so it
+        // handles all of these exactly. parse_reweight_specs guarantees the edge
+        // exists, so the node indices are in range.
+        // TODO(deeper): these rules hand-mirror iter_discretized_edges' boundary
+        // routing and min-merge policy (user_graph.h). If that build policy
+        // changes, update these to match -- or better, record slot dedication at
+        // build time and expose an edge_has_dedicated_slot() query for this
+        // check to consume.
+        if (rw.node2 == SIZE_MAX) {
+            // Explicit boundary edge (u,-1): its discretized slot is shared with
+            // any edge (u,v) where v is a boundary node (min-merged), and it has
+            // no slot at all if u is itself a boundary node.
+            if (nodes[rw.node1].is_boundary || has_boundary_node_neighbor(rw.node1))
+                return true;
         } else {
-            // Looking for regular edge
-            if (neighbors[i] != nullptr && (neighbors[i] - &_mwpm.flooder.graph.nodes[0]) == node2) {
-                return i;
-            }
+            // Edge (u,v): if either endpoint is a boundary node, the edge is
+            // stored as a nullptr boundary slot at the other endpoint (or not at
+            // all), which the Tier-1 pointer lookup cannot address.
+            if (nodes[rw.node1].is_boundary || nodes[rw.node2].is_boundary)
+                return true;
         }
     }
-    return SIZE_MAX;
+
+    return max_new_abs_weight > original_max_abs_weight;
 }
 
-size_t pm::UserGraph::find_neighbor_index_in_search_graph(size_t node1, size_t node2) {
-    if (node1 >= _mwpm.search_flooder.graph.nodes.size()) {
-        return SIZE_MAX;
+void pm::UserGraph::write_reweight_slots(const EdgeReweight& rw, pm::weight_int value) {
+    // A SIZE_MAX index means the slot does not exist (boundary edge reverse
+    // direction, edge absent from the graph, or the graph itself is absent).
+    if (rw.matching_graph_node1_neighbor_idx != SIZE_MAX) {
+        _mwpm.flooder.graph.nodes[rw.node1].neighbor_weights[rw.matching_graph_node1_neighbor_idx] = value;
     }
-
-    const auto& neighbors = _mwpm.search_flooder.graph.nodes[node1].neighbors;
-    for (size_t i = 0; i < neighbors.size(); i++) {
-        if (node2 == SIZE_MAX) {
-            // Looking for boundary edge
-            if (neighbors[i] == nullptr) {
-                return i;
-            }
-        } else {
-            // Looking for regular edge
-            if (neighbors[i] != nullptr && (neighbors[i] - &_mwpm.search_flooder.graph.nodes[0]) == node2) {
-                return i;
-            }
-        }
+    if (rw.node2 != SIZE_MAX && rw.matching_graph_node2_neighbor_idx != SIZE_MAX) {
+        _mwpm.flooder.graph.nodes[rw.node2].neighbor_weights[rw.matching_graph_node2_neighbor_idx] = value;
     }
-    return SIZE_MAX;
+    if (rw.search_graph_node1_neighbor_idx != SIZE_MAX) {
+        _mwpm.search_flooder.graph.nodes[rw.node1].neighbor_weights[rw.search_graph_node1_neighbor_idx] = value;
+    }
+    if (rw.node2 != SIZE_MAX && rw.search_graph_node2_neighbor_idx != SIZE_MAX) {
+        _mwpm.search_flooder.graph.nodes[rw.node2].neighbor_weights[rw.search_graph_node2_neighbor_idx] = value;
+    }
 }
-
 
 void pm::UserGraph::populate_implied_edge_weights(
     std::map<std::pair<size_t, size_t>, std::map<std::pair<size_t, size_t>, double>>& joint_probabilites) {
@@ -964,4 +935,6 @@ void pm::UserGraph::populate_implied_edge_weights(
             }
         }
     }
+    // Implied weights feed the cached edge stats.
+    invalidate_edge_stats();
 }
