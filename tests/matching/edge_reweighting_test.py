@@ -86,39 +86,47 @@ class TestEdgeReweighting:
         assert correction is not None
 
     def test_reweighting_without_regeneration(self):
-        """Test edge reweighting without graph regeneration (direct weight updates)."""
-        m = Matching()
-        m.add_edge(0, 1, weight=2.0, fault_ids=0)  # Original max weight is 2.0
-        m.add_edge(1, 2, weight=1.0, fault_ids=1)
-        m.add_boundary_edge(0, weight=1.5, fault_ids=2)
-
-        # Reweight with values <= original max (should avoid regeneration)
-        edge_reweights = np.array([
-            [0, 1, 1.5],   # New weight <= original max (2.0)
-            [1, 2, 0.5],   # New weight <= original max
-        ], dtype=np.float64)
+        """Tier-1 (reweight <= max, no regeneration): in-place weight updates must
+        match a matcher built from scratch with the same weights. boundary(2)=5.0
+        pins the max weight so both share the same discretization."""
+        def build(w01, w12):
+            m = Matching()
+            m.add_edge(0, 1, weight=w01, fault_ids=0)
+            m.add_edge(1, 2, weight=w12, fault_ids=1)
+            m.add_boundary_edge(0, weight=1.5, fault_ids=2)
+            m.add_boundary_edge(2, weight=5.0, fault_ids=3)  # pins max at 5.0
+            return m
 
         syndrome = np.array([1, 0, 1])
-        correction = m.decode(syndrome, edge_reweights=edge_reweights)
-
-        assert correction is not None
+        corr, w = build(2.0, 1.0).decode(
+            syndrome,
+            edge_reweights=np.array([[0, 1, 1.5], [1, 2, 0.5]], dtype=np.float64),
+            return_weight=True,
+        )
+        corr_oracle, w_oracle = build(1.5, 0.5).decode(syndrome, return_weight=True)
+        np.testing.assert_array_equal(corr, corr_oracle)
+        assert np.isclose(w, w_oracle)
 
     def test_reweighting_with_regeneration(self):
-        """Test edge reweighting with graph regeneration (full regeneration)."""
-        m = Matching()
-        m.add_edge(0, 1, weight=1.0, fault_ids=0)  # Original max weight is 1.0
-        m.add_edge(1, 2, weight=0.5, fault_ids=1)
-        m.add_boundary_edge(0, weight=0.8, fault_ids=2)
-
-        # Reweight with values > original max (should trigger regeneration)
-        edge_reweights = np.array([
-            [0, 1, 5.0],   # New weight > original max (1.0)
-        ], dtype=np.float64)
+        """Tier-2 (reweight > max, full regeneration): the rebuilt graph must match a
+        matcher built from scratch with the reweighted edge (both regenerate to the
+        same weights/normalisation)."""
+        def build(w01):
+            m = Matching()
+            m.add_edge(0, 1, weight=w01, fault_ids=0)
+            m.add_edge(1, 2, weight=0.5, fault_ids=1)
+            m.add_boundary_edge(0, weight=0.8, fault_ids=2)
+            return m
 
         syndrome = np.array([1, 0, 1])
-        correction = m.decode(syndrome, edge_reweights=edge_reweights)
-
-        assert correction is not None
+        corr, w = build(1.0).decode(
+            syndrome,
+            edge_reweights=np.array([[0, 1, 5.0]], dtype=np.float64),  # > max 1.0 -> Tier 2
+            return_weight=True,
+        )
+        corr_oracle, w_oracle = build(5.0).decode(syndrome, return_weight=True)
+        np.testing.assert_array_equal(corr, corr_oracle)
+        assert np.isclose(w, w_oracle)
 
     def test_batch_decoding_with_reweights(self):
         """Test batch decoding with edge reweights."""
@@ -167,47 +175,49 @@ class TestEdgeReweighting:
         np.testing.assert_array_equal(correction_orig, correction_restored)
 
     def test_return_weight_with_reweights(self):
-        """Test that return_weight works correctly with reweights."""
-        m = Matching()
-        m.add_edge(0, 1, weight=1.0)
-        m.add_boundary_edge(0, weight=0.5)
-        m.add_boundary_edge(1, weight=0.5)
+        """return_weight reports the reweighted solution weight -- the exact expected
+        value, matching an oracle (not merely != the un-reweighted weight)."""
+        def build(w01):
+            m = Matching()
+            m.add_edge(0, 1, weight=w01, fault_ids=0)
+            m.add_boundary_edge(0, weight=3.0, fault_ids=1)  # pins max; boundary pair costs 6.0
+            m.add_boundary_edge(1, weight=3.0, fault_ids=2)
+            return m
 
-        syndrome = np.array([1, 1])
-
-        # Get weight without reweights
-        correction_orig, weight_orig = m.decode(syndrome, return_weight=True)
-
-        # Get weight with reweights
-        edge_reweights = np.array([[0, 1, 2.0]], dtype=np.float64)
-        correction_reweighted, weight_reweighted = m.decode(
-            syndrome, edge_reweights=edge_reweights, return_weight=True
+        syndrome = np.array([1, 1])  # edge(0,1) route beats the boundary pair
+        _, weight_orig = build(1.0).decode(syndrome, return_weight=True)
+        corr, weight_rw = build(1.0).decode(
+            syndrome, edge_reweights=np.array([[0, 1, 0.5]], dtype=np.float64), return_weight=True
         )
+        _, weight_oracle = build(0.5).decode(syndrome, return_weight=True)
 
-        assert isinstance(weight_orig, (int, float))
-        assert isinstance(weight_reweighted, (int, float))
-        # Weight should be different due to reweighting
-        assert weight_reweighted != weight_orig
+        assert np.isclose(weight_orig, 1.0)
+        assert np.isclose(weight_rw, weight_oracle)
+        assert np.isclose(weight_rw, 0.5)  # exact reweighted value, not just "different"
 
     def test_correlations_with_reweights(self):
-        """Test that enable_correlations works with reweights."""
-        m = Matching()
-        m.add_edge(0, 1, weight=1.0)
-        m.add_edge(1, 2, weight=1.0)
-        m.add_boundary_edge(0, weight=1.0)
-        m.add_boundary_edge(2, weight=1.0)
+        """enable_correlations reweights the search graph too; the result must match a
+        freshly-built matcher with the reweighted edge (same normalisation via a pinned max)."""
+        def build(w01):
+            m = Matching()
+            m.add_edge(0, 1, weight=w01, fault_ids=0)
+            m.add_edge(1, 2, weight=1.0, fault_ids=1)
+            m.add_boundary_edge(0, weight=3.0, fault_ids=2)  # pins max at 3.0
+            m.add_boundary_edge(2, weight=3.0, fault_ids=3)
+            return m
 
         syndrome = np.array([1, 0, 1])
-        edge_reweights = np.array([[0, 1, 0.5]], dtype=np.float64)
-
-        # Should work without throwing an exception
-        correction = m.decode(
+        corr, w = build(2.0).decode(
             syndrome,
-            edge_reweights=edge_reweights,
-            enable_correlations=True
+            edge_reweights=np.array([[0, 1, 0.5]], dtype=np.float64),
+            enable_correlations=True,
+            return_weight=True,
         )
-
-        assert correction is not None
+        corr_oracle, w_oracle = build(0.5).decode(
+            syndrome, enable_correlations=True, return_weight=True
+        )
+        np.testing.assert_array_equal(corr, corr_oracle)
+        assert np.isclose(w, w_oracle)
 
     def test_invalid_edge_specification(self):
         """Test error handling for invalid edge specifications."""
@@ -246,24 +256,23 @@ class TestEdgeReweighting:
             m.decode(syndrome, edge_reweights=edge_reweights)
 
     def test_reweighting_with_check_matrix(self):
-        """Test edge reweighting with graphs created from check matrices."""
-        # Create a simple repetition code
+        """Reweighting on a graph built from a check matrix yields the expected
+        correction, exercising the check-matrix edge indexing (not just 'no crash').
+
+        The rep code has boundary edge (0,) = fault 0, edge (0,1) = fault 1, boundary
+        edge (1,) = fault 2 (all unit weight). Syndrome [1,0] normally pairs detector 0
+        to its boundary (fault 0). Making that boundary edge expensive forces the route
+        via edge (0,1) + boundary (1,) instead (faults 1 and 2).
+        """
         H = csc_matrix(([1, 1, 1, 1], ([0, 0, 1, 1], [0, 1, 1, 2])), shape=(2, 3))
-        m = Matching(H)
+        m = Matching(H)  # edges: (0,2)=fault 0, (0,1)=fault 1, (1,2)=fault 2 (node 2 is boundary)
+        syndrome = np.array([1, 1])
 
-        syndrome = np.array([1, 0])
-
-        # The exact edge indices depend on how the graph is constructed from H
-        # This test mainly ensures no crashes occur
-        edge_reweights = np.array([[0, 1, 0.5]], dtype=np.float64)
-
-        try:
-            correction = m.decode(syndrome, edge_reweights=edge_reweights)
-            assert correction is not None
-        except ValueError:
-            # If the edge doesn't exist in this particular graph construction,
-            # that's also acceptable - the important thing is proper error handling
-            pass
+        # Default: pair the two defects directly via edge (0,1) = fault 1.
+        np.testing.assert_array_equal(m.decode(syndrome), [0, 1, 0])
+        # Make edge (0,1) expensive -> route each defect via node 2 instead (faults 0 and 2).
+        corr = m.decode(syndrome, edge_reweights=np.array([[0, 1, 3.0]], dtype=np.float64))
+        np.testing.assert_array_equal(corr, [1, 0, 1])
 
     def test_empty_reweights_array(self):
         """Test behavior with empty reweights array."""
@@ -304,40 +313,47 @@ class TestEdgeReweighting:
         assert corrections.shape[0] == 2
 
     def test_exception_safety_single_decode(self):
-        """Test that weights are restored even if decoding throws an exception."""
-        m = Matching()
-        m.add_edge(0, 1, weight=1.0)
+        """When decoding raises *after* reweights are applied, the weights must be
+        restored. Force a real exception (a boundaryless odd-parity syndrome has no
+        matching) and check the graph is pristine afterwards."""
+        def build():
+            m = Matching()
+            m.add_edge(0, 1, weight=1.0, fault_ids=0)  # no boundary -> [1,0,0] is unmatchable
+            m.add_edge(1, 2, weight=1.0, fault_ids=1)
+            return m
 
-        # This test is more about ensuring the C++ exception safety works
-        # In practice, it's hard to force a decode exception, but the structure should be there
-        syndrome = np.array([1, 1])
-        edge_reweights = np.array([[0, 1, 0.5]], dtype=np.float64)
+        m = build()
+        # Reweight is applied, then decoding the unmatchable syndrome raises.
+        with pytest.raises(ValueError):
+            m.decode(np.array([1, 0, 0]), edge_reweights=np.array([[0, 1, 0.5]], dtype=np.float64))
 
-        # Normal decode should work
-        correction = m.decode(syndrome, edge_reweights=edge_reweights)
-        assert correction is not None
-
-        # Verify weights are restored by doing another decode
-        correction2 = m.decode(syndrome)
-        assert correction2 is not None
+        # After the exception the graph must be restored: a valid decode matches a fresh matcher.
+        syndrome = np.array([1, 1, 0])
+        corr, w = m.decode(syndrome, return_weight=True)
+        corr_fresh, w_fresh = build().decode(syndrome, return_weight=True)
+        np.testing.assert_array_equal(corr, corr_fresh)
+        assert np.isclose(w, w_fresh)
 
     def test_exception_safety_batch_decode(self):
-        """Test that weights are restored even if batch decoding throws an exception."""
-        m = Matching()
-        m.add_edge(0, 1, weight=1.0)
-        m.add_boundary_edge(0, weight=1.0)
-        m.add_boundary_edge(1, weight=1.0)
+        """When a batch decode raises after reweights are applied, weights are restored."""
+        def build():
+            m = Matching()
+            m.add_edge(0, 1, weight=1.0, fault_ids=0)  # no boundary -> [1,0,0] unmatchable
+            m.add_edge(1, 2, weight=1.0, fault_ids=1)
+            return m
 
-        shots = np.array([[1, 1]], dtype=np.uint8)
-        edge_reweights = [np.array([[0, 1, 0.5]], dtype=np.float64)]
-
-        # Normal batch decode should work
-        corrections = m.decode_batch(shots, edge_reweights=edge_reweights)
-        assert corrections.shape[0] == 1
-
-        # Verify weights are restored
-        correction_after = m.decode(np.array([1, 1]))
-        assert correction_after is not None
+        m = build()
+        with pytest.raises(ValueError):
+            m.decode_batch(
+                np.array([[1, 0, 0]], dtype=np.uint8),
+                edge_reweights=[np.array([[0, 1, 0.5]], dtype=np.float64)],
+            )
+        # Graph pristine afterwards.
+        syndrome = np.array([1, 1, 0])
+        corr, w = m.decode(syndrome, return_weight=True)
+        corr_fresh, w_fresh = build().decode(syndrome, return_weight=True)
+        np.testing.assert_array_equal(corr, corr_fresh)
+        assert np.isclose(w, w_fresh)
 
     def test_batch_decoding_with_stride(self):
         """Test batch decoding with stride > 1."""
@@ -731,6 +747,59 @@ class TestEdgeReweighting:
         m.add_edge(0, 1, weight=1.0)
         with pytest.raises(ValueError):
             m.decode(np.array([1, 1]), edge_reweights=np.array([[-1.0, 1.0, 0.5]]))
+
+    def test_negative_weight_in_graph_rejected(self):
+        """Reweighting is unsupported (and must raise) when the graph itself contains a
+        negative edge weight -- distinct from a negative reweight *value*."""
+        m = Matching()
+        m.add_edge(0, 1, weight=-1.0, fault_ids=0)
+        m.add_boundary_edge(0, weight=1.0, fault_ids=1)
+        m.add_boundary_edge(1, weight=1.0, fault_ids=2)
+        with pytest.raises(ValueError, match="negative"):
+            m.decode(np.array([1, 1]), edge_reweights=np.array([[0, 1, 0.5]], dtype=np.float64))
+
+    def test_stride_value_correctness(self):
+        """With stride>1, each block's rule applies to its shots and the per-shot
+        weights match per-block oracles (not just a shape check)."""
+        def build(w01=2.0):
+            m = Matching()
+            m.add_edge(0, 1, weight=w01, fault_ids=0)
+            m.add_boundary_edge(0, weight=3.0, fault_ids=1)  # pins max at 3.0
+            m.add_boundary_edge(1, weight=3.0, fault_ids=2)
+            return m
+
+        shots = np.tile(np.array([1, 1], dtype=np.uint8), (4, 1))
+        _, ws = build().decode_batch(
+            shots,
+            edge_reweights=[np.array([[0, 1, 0.5]]), np.array([[0, 1, 2.5]])],  # blocks 0-1, 2-3
+            reweight_stride=2,
+            return_weights=True,
+        )
+        _, w0 = build(0.5).decode(np.array([1, 1]), return_weight=True)
+        _, w1 = build(2.5).decode(np.array([1, 1]), return_weight=True)
+        assert np.allclose(ws, [w0, w0, w1, w1])
+
+    def test_regeneration_in_non_first_block(self):
+        """A regeneration-triggering reweight in a block that is NOT block 0 decodes
+        correctly and does not corrupt the (un-reweighted) earlier block."""
+        def build(w01=1.0):
+            m = Matching()
+            m.add_edge(0, 1, weight=w01, fault_ids=0)
+            m.add_boundary_edge(0, weight=1.0, fault_ids=1)
+            m.add_boundary_edge(1, weight=1.0, fault_ids=2)
+            return m
+
+        shots = np.tile(np.array([1, 1], dtype=np.uint8), (2, 1))
+        _, ws = build().decode_batch(
+            shots,
+            edge_reweights=[None, np.array([[0, 1, 5.0]])],  # block 1 (>max) regenerates
+            reweight_stride=1,
+            return_weights=True,
+        )
+        _, w0 = build().decode(np.array([1, 1]), return_weight=True)       # original graph
+        _, w1 = build(5.0).decode(np.array([1, 1]), return_weight=True)    # regenerated oracle
+        assert np.isclose(ws[0], w0)
+        assert np.isclose(ws[1], w1)
 
 
 if __name__ == "__main__":
