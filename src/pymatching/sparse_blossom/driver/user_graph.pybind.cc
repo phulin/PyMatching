@@ -84,6 +84,16 @@ pm::MERGE_STRATEGY merge_strategy_from_string(const std::string &merge_strategy)
     }
 }
 
+// Validate that an edge_reweights array has the expected (N, 3) shape before its
+// elements are read with unchecked<2>(), which performs no bounds checking (reading
+// a column that does not exist is an out-of-bounds access).
+static void validate_reweights_array(const py::array_t<double> &arr) {
+    if (arr.ndim() != 2 || arr.shape(1) != 3)
+        throw std::invalid_argument(
+            "edge_reweights must be a 2D array of shape (N, 3) with columns "
+            "[node1, node2, weight]");
+}
+
 void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGraph> &g) {
     g.def(py::init<>());
     g.def(py::init<size_t>(), "num_nodes"_a);
@@ -189,6 +199,7 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
             // Handle edge reweights if provided
             if (has_reweights) {
                 py::array_t<double> reweights_array = edge_reweights.cast<py::array_t<double>>();
+                validate_reweights_array(reweights_array);
                 auto reweights_unchecked = reweights_array.unchecked<2>();
                 std::vector<std::array<double, 3>> reweight_specs;
 
@@ -212,7 +223,9 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                 // Perform decoding
                 std::vector<uint64_t> detection_events_vec(
                     detection_events.data(), detection_events.data() + detection_events.size());
-                auto obs_crossed = new std::vector<uint8_t>(self.get_num_observables(), 0);
+                // Owned by a unique_ptr so an exception below (decode or restore) frees
+                // it rather than leaking; ownership is handed to the capsule on success.
+                auto obs_crossed = std::make_unique<std::vector<uint8_t>>(self.get_num_observables(), 0);
                 pm::total_weight_int weight = 0;
                 pm::decode_detection_events(mwpm, detection_events_vec, obs_crossed->data(), weight, enable_correlations);
                 double rescaled_weight = (double)weight / mwpm.flooder.graph.normalising_constant;
@@ -222,11 +235,12 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                     self.restore_weights(needs_regeneration);
                 }
 
-                auto err_capsule = py::capsule(obs_crossed, [](void *x) {
+                auto *obs_crossed_raw = obs_crossed.release();
+                auto err_capsule = py::capsule(obs_crossed_raw, [](void *x) {
                     delete reinterpret_cast<std::vector<uint8_t> *>(x);
                 });
                 py::array_t<uint8_t> obs_crossed_arr =
-                    py::array_t<uint8_t>(obs_crossed->size(), obs_crossed->data(), err_capsule);
+                    py::array_t<uint8_t>(obs_crossed_raw->size(), obs_crossed_raw->data(), err_capsule);
                 std::pair<py::array_t<std::uint8_t>, double> res = {obs_crossed_arr, rescaled_weight};
                 return res;
 
@@ -337,6 +351,12 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
 
             // Handle edge reweights if provided - expect list of arrays for reweight rules
             bool has_reweights = !edge_reweights.is_none();
+            // reweight_stride is used in the per-shot modulo below regardless of whether
+            // reweights were supplied, so validate it unconditionally: a stride of 0 would
+            // otherwise be an integer division by zero (a hard crash, not a Python error).
+            if (reweight_stride < 1)
+                throw std::invalid_argument(
+                    "reweight_stride must be a positive integer, got " + std::to_string(reweight_stride));
             // Per-block regeneration decision. Each block's apply AND restore use the
             // SAME flag, so a block that mutates the UserGraph (Tier 2) is always undone
             // by a matching Tier-2 restore. `active_block_regen` tracks the in-flight
@@ -346,12 +366,6 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
             std::vector<std::vector<std::array<double, 3>>> all_reweight_specs;
 
             if (has_reweights) {
-                // Validate stride parameter
-                if (reweight_stride < 1) {
-                    throw std::invalid_argument(
-                        "reweight_stride must be a positive integer, got " + std::to_string(reweight_stride));
-                }
-
                 py::list reweights_list = edge_reweights.cast<py::list>();
                 size_t num_rules = reweights_list.size();
                 size_t num_shots = shots.shape(0);
@@ -379,6 +393,7 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                     }
 
                     py::array_t<double> rule_reweights = rule_reweights_obj.cast<py::array_t<double>>();
+                    validate_reweights_array(rule_reweights);
                     auto reweights_unchecked = rule_reweights.unchecked<2>();
 
                     for (py::ssize_t j = 0; j < reweights_unchecked.shape(0); j++) {
@@ -484,10 +499,18 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                         ws(i) = (double)solution_weight / mwpm.flooder.graph.normalising_constant;
                     } catch (const std::invalid_argument&) {
                         if (!logical_error_if_no_matching) throw;
-                        // No perfect matching found — force logical error by setting all
-                        // observable prediction bits to 1. XOR with actual observable flips
-                        // will be nonzero (the unused high bits guarantee this).
-                        memset(predictions_ptr + (num_observable_bytes * i), 0xFF, num_observable_bytes);
+                        // No perfect matching: predict every observable flipped so the shot
+                        // registers as a logical error. Honour the prediction format -- one
+                        // byte per observable (value 1) when unpacked, or exactly the low
+                        // num_observables bits when packed -- rather than 0xFF, which would
+                        // emit non-binary 255s (unpacked) and set garbage high bits (packed).
+                        uint8_t *pred = predictions_ptr + (num_observable_bytes * i);
+                        if (bit_packed_predictions) {
+                            for (size_t k = 0; k < self.get_num_observables(); k++)
+                                pred[k >> 3] |= (uint8_t)(1 << (k & 7));
+                        } else {
+                            std::memset(pred, 1, num_observable_bytes);
+                        }
                         ws(i) = 0.0;
                     }
                     detection_events.clear();

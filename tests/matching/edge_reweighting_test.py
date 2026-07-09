@@ -699,6 +699,50 @@ class TestEdgeReweighting:
         np.testing.assert_array_equal(corr, corr_o)
         assert np.isclose(weight, weight_o)
 
+    def test_reweights_invalid_shape_raises(self):
+        """C2: an edge_reweights array without exactly 3 columns must raise a clear
+        error instead of reading out of bounds."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        syndrome = np.array([1, 1])
+        for bad in (np.zeros((1, 2)), np.zeros((1, 4)), np.zeros((2, 2))):
+            with pytest.raises(ValueError, match="shape"):
+                m.decode(syndrome, edge_reweights=bad.astype(np.float64))
+        with pytest.raises(ValueError, match="shape"):
+            m.decode_batch(
+                np.array([[1, 1]], dtype=np.uint8),
+                edge_reweights=[np.zeros((1, 2), dtype=np.float64)],
+            )
+
+    def test_reweight_stride_zero_raises(self):
+        """C3: reweight_stride=0 must raise even when edge_reweights is None
+        (previously integer division by zero -> hard crash)."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        m.add_boundary_edge(0, weight=1.0)
+        m.add_boundary_edge(1, weight=1.0)
+        with pytest.raises(ValueError, match="positive integer"):
+            m.decode_batch(np.array([[1, 1]], dtype=np.uint8), reweight_stride=0)
+
+    def test_reweight_negative_node_raises(self):
+        """C7: a negative node index must raise, not invoke undefined behaviour
+        casting a negative double to size_t."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0)
+        with pytest.raises(ValueError):
+            m.decode(np.array([1, 1]), edge_reweights=np.array([[-1.0, 1.0, 0.5]]))
+
+    def test_logical_error_predictions_are_binary(self):
+        """C5: logical_error_if_no_matching must emit binary predictions (1), not
+        255, on a shot with no perfect matching."""
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0, fault_ids=0)  # no boundary -> [1,0] has no matching
+        preds = m.decode_batch(
+            np.array([[1, 0]], dtype=np.uint8), logical_error_if_no_matching=True
+        )
+        assert set(np.unique(preds)).issubset({0, 1})
+        assert preds[0, 0] == 1
+
 
 if __name__ == "__main__":
     pytest.main([__file__])

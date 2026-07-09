@@ -674,6 +674,10 @@ void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& re
 
     // Validate and prepare reweights
     for (const auto& spec : reweight_specs) {
+        // spec[0] is a user-supplied double; guard the unsigned conversion, since a
+        // negative or non-finite value is undefined behaviour when cast to size_t.
+        if (spec[0] < 0 || !std::isfinite(spec[0]))
+            throw std::invalid_argument("Reweight node1 index must be a non-negative integer");
         size_t node1 = (size_t)spec[0];
         double node2_raw = spec[1];
         size_t node2;
