@@ -201,6 +201,9 @@ void pm::UserGraph::set_boundary(const std::set<size_t>& boundary) {
         nodes[n].is_boundary = true;
     }
     _mwpm_needs_updating = true;
+    // Topology changed: a node switching boundary status resizes/reorders its neighbor
+    // arrays when the graph is rebuilt, so any cached edge-neighbor indices are stale.
+    _edge_index_cache_valid = false;
 }
 
 std::set<size_t> pm::UserGraph::get_boundary() {
@@ -226,6 +229,9 @@ bool pm::UserGraph::is_boundary_node(size_t node_id) {
 void pm::UserGraph::update_mwpm() {
     _mwpm = to_mwpm(pm::NUM_DISTINCT_WEIGHTS, false);
     _mwpm_needs_updating = false;
+    // The matching/search graphs were rebuilt; any cached edge-neighbor indices point
+    // into the old, now-freed neighbor arrays.
+    _edge_index_cache_valid = false;
 }
 
 pm::Mwpm& pm::UserGraph::get_mwpm() {
@@ -370,6 +376,7 @@ pm::Mwpm& pm::UserGraph::get_mwpm_with_search_graph() {
     } else {
         _mwpm = to_mwpm(pm::NUM_DISTINCT_WEIGHTS, true);
         _mwpm_needs_updating = false;
+        _edge_index_cache_valid = false;  // rebuilt graphs invalidate cached neighbor indices
         return _mwpm;
     }
 }

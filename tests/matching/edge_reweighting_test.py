@@ -665,6 +665,40 @@ class TestEdgeReweighting:
             assert np.isclose(weight, weight_oracle, atol=1e-5)
             assert np.isclose(weight, v, atol=1e-5)  # not rounded to an integer
 
+    def test_reweight_after_set_boundary_uses_fresh_cache(self):
+        """Regression for a stale edge-index cache (a segfault).
+
+        set_boundary -- and any graph regeneration -- rebuilds the per-node
+        neighbor arrays that Tier-1 reweighting indexes into. The edge-index cache
+        must be invalidated; otherwise a later reweighted decode reuses indices
+        computed against the old graph and writes to a stale / out-of-bounds slot.
+        Uses non-integer base weights so the reweight stays on the Tier-1 (cached)
+        path rather than regenerating.
+        """
+        def build():
+            m = Matching()
+            m.add_edge(0, 1, weight=1.3, fault_ids=0)
+            m.add_edge(1, 2, weight=1.3, fault_ids=1)
+            m.add_edge(2, 3, weight=1.3, fault_ids=2)
+            m.add_boundary_edge(0, weight=1.3, fault_ids=3)
+            return m
+
+        syndrome = np.array([0, 0, 1, 1])
+        rw = np.array([[1, 2, 0.5]], dtype=np.float64)
+
+        m = build()
+        m.decode(syndrome, edge_reweights=np.array([[2, 3, 0.5]], dtype=np.float64))  # build cache
+        m.set_boundary_nodes({1})                                                     # rebuild graph
+        corr, weight = m.decode(syndrome, edge_reweights=rw, return_weight=True)       # must not crash
+
+        # Oracle: a fresh matcher whose cache is built after the same topology change.
+        oracle = build()
+        oracle.set_boundary_nodes({1})
+        corr_o, weight_o = oracle.decode(syndrome, edge_reweights=rw, return_weight=True)
+
+        np.testing.assert_array_equal(corr, corr_o)
+        assert np.isclose(weight, weight_o)
+
 
 if __name__ == "__main__":
     pytest.main([__file__])
