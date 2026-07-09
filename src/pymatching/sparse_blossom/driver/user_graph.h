@@ -154,10 +154,6 @@ class UserGraph {
     void apply_reweights(const std::vector<std::array<double, 3>>& reweight_specs, pm::Mwpm& mwpm, bool needs_regeneration = false);
     void restore_weights(bool needs_regeneration = false);
     bool needs_regeneration(const std::vector<std::array<double, 3>>& reweight_specs);
-    bool batch_needs_regeneration(const std::vector<std::vector<std::array<double, 3>>>& all_reweight_specs);
-
-    /// Get cached max absolute weight (lazy evaluation)
-    double get_cached_max_abs_weight();
 
     /// Invalidate the max weight cache (call when edges are modified)
     void invalidate_max_weight_cache();
@@ -180,8 +176,6 @@ class UserGraph {
     /// edge directions, in the matching graph and -- if present -- the search
     /// graph). Used by Tier-1 apply (new weight) and restore (snapshot).
     void write_reweight_slots(const EdgeReweight& rw, weight_int value);
-    size_t find_neighbor_index_in_matching_graph(size_t node1, size_t node2);
-    size_t find_neighbor_index_in_search_graph(size_t node1, size_t node2);
 };
 
 double to_weight_for_correlations(double probability);

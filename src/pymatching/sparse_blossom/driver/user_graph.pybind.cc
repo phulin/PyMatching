@@ -219,7 +219,10 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
 
                 // Get mwpm first, then apply reweights with the mwpm object
                 self.apply_reweights(reweight_specs, mwpm, needs_regeneration);
-                auto &mwpm = enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm();
+                // Called for its side effect only: materialise a Tier-2 regeneration
+                // before decoding. `mwpm` already references the persistent _mwpm
+                // member, which is rebuilt in place, so it needs no re-binding.
+                (void)(enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm());
             }
 
             try {
@@ -464,9 +467,10 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                     // effect: this block's Tier-2 apply, or a previous block's Tier-2
                     // restore ahead of a block that carries no reweights. `mwpm` is a
                     // reference to the persistent _mwpm member, so it reflects the rebuilt
-                    // graph. In the common Tier-1 path _mwpm_needs_updating stays false and
-                    // this is an O(1) cached return.
-                    if (has_reweights)
+                    // graph. A regeneration can only become pending at a block boundary
+                    // (apply above, or the previous block's restore), so only the first
+                    // shot of a block needs the refresh.
+                    if (has_reweights && is_first_shot_in_block)
                         (void)(enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm());
 
                     // Extract detection events for this shot
