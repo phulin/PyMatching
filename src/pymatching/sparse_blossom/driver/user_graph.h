@@ -53,6 +53,9 @@ struct EdgeReweight {
     size_t matching_graph_node2_neighbor_idx;  // SIZE_MAX if boundary edge
     size_t search_graph_node1_neighbor_idx;
     size_t search_graph_node2_neighbor_idx;    // SIZE_MAX if boundary edge
+    /// Snapshot of the discretized weight the graph held at apply time; restore
+    /// writes it back verbatim (re-deriving it from original_weight risks
+    /// mismatching the build-time discretization).
     weight_int original_normalized_weight;
     weight_int new_normalized_weight;
 };
@@ -168,15 +171,15 @@ class UserGraph {
     // Reweighting state
     std::vector<EdgeReweight> _active_reweights;
 
-    // Optimization 3: Reusable reweight buffer to avoid heap allocations
-    std::vector<EdgeReweight> _reweight_buffer;
-
     // Optimization 5: Lazy max weight caching
     double _cached_max_abs_weight;
     bool _max_weight_cache_valid;
 
     // Internal reweighting helper methods
-    void update_existing_graph_weights();
+    /// Write `value` into every discretized-weight slot referenced by `rw` (both
+    /// edge directions, in the matching graph and -- if present -- the search
+    /// graph). Used by Tier-1 apply (new weight) and restore (snapshot).
+    void write_reweight_slots(const EdgeReweight& rw, weight_int value);
     size_t find_neighbor_index_in_matching_graph(size_t node1, size_t node2);
     size_t find_neighbor_index_in_search_graph(size_t node1, size_t node2);
 };
