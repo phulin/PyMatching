@@ -199,13 +199,13 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
             bool has_reweights = !edge_reweights.is_none();
             bool needs_regeneration = false;
 
-            // Handle edge reweights if provided
+            // Parse the reweight specs (pure -- touches no graph state, safe
+            // outside the try).
+            std::vector<std::array<double, 3>> reweight_specs;
             if (has_reweights) {
                 py::array_t<double> reweights_array = edge_reweights.cast<py::array_t<double>>();
                 validate_reweights_array(reweights_array);
                 auto reweights_unchecked = reweights_array.unchecked<2>();
-                std::vector<std::array<double, 3>> reweight_specs;
-
                 for (py::ssize_t i = 0; i < reweights_unchecked.shape(0); i++) {
                     reweight_specs.push_back({
                         reweights_unchecked(i, 0),
@@ -213,19 +213,25 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                         reweights_unchecked(i, 2)
                     });
                 }
-
-                // Determine if regeneration is needed
-                needs_regeneration = self.needs_regeneration(reweight_specs);
-
-                // Get mwpm first, then apply reweights with the mwpm object
-                self.apply_reweights(reweight_specs, mwpm, needs_regeneration);
-                // Called for its side effect only: materialise a Tier-2 regeneration
-                // before decoding. `mwpm` already references the persistent _mwpm
-                // member, which is rebuilt in place, so it needs no re-binding.
-                (void)(enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm());
             }
 
             try {
+                // Apply reweights INSIDE the try, so a throw anywhere after graph
+                // state is first touched -- including a Tier-2 regeneration failing
+                // in the refresh below -- reaches the catch block's restore. This
+                // used to sit before the try: a throwing regeneration then left the
+                // UserGraph permanently holding the per-shot weights (matching
+                // decode_batch, which has always kept its apply inside its try).
+                if (has_reweights) {
+                    needs_regeneration = self.needs_regeneration(reweight_specs);
+                    self.apply_reweights(reweight_specs, mwpm, needs_regeneration);
+                    // Called for its side effect only: materialise a Tier-2
+                    // regeneration before decoding. `mwpm` already references the
+                    // persistent _mwpm member, which is rebuilt in place, so it
+                    // needs no re-binding.
+                    (void)(enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm());
+                }
+
                 // Perform decoding
                 std::vector<uint64_t> detection_events_vec(
                     detection_events.data(), detection_events.data() + detection_events.size());

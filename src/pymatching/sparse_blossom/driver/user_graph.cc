@@ -564,7 +564,14 @@ void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& re
         throw std::invalid_argument("Edge reweighting not supported with negative edge weights");
     }
 
-    _active_reweights.clear();
+    // Validate into a local vector and commit to _active_reweights only after the
+    // whole spec list has passed (strong exception guarantee). A throw part-way
+    // through must leave _active_reweights untouched: stale partial entries from a
+    // failed call would otherwise be replayed into the graph by a later
+    // exception-path restore_weights, silently overwriting weights the user set
+    // in the meantime.
+    std::vector<EdgeReweight> validated;
+    validated.reserve(reweight_specs.size());
 
     // Validate and prepare reweights
     for (const auto& spec : reweight_specs) {
@@ -637,8 +644,13 @@ void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& re
         reweight.original_normalized_weight = 0;
         reweight.new_normalized_weight = 0;
 
-        _active_reweights.push_back(reweight);
+        validated.push_back(reweight);
     }
+
+    // Every spec validated; commit. From here on nothing throws before the
+    // apply completes (Tier-1 writes discretized ints; Tier-2 writes UserGraph
+    // floats for edges the validation loop just resolved).
+    _active_reweights = std::move(validated);
 
     if (needs_regeneration) {
         // Full regeneration - need to update UserGraph edges

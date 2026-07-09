@@ -862,6 +862,59 @@ class TestReweightInputValidation:
             m.decode(self.SYNDROME, edge_reweights=np.array([[0, 999, 0.5]]))
         self.assert_unchanged(m)
 
+    def test_failed_validation_leaves_no_stale_reweights(self):
+        # Regression test for a stale-state replay: a validation throw used to
+        # leave partially-validated entries in the active-reweight list (no
+        # restore runs, since decode's apply threw before any decode), and a
+        # LATER exception-path restore_weights replayed them into the UserGraph,
+        # silently overwriting a weight the user had changed in the meantime.
+        m = Matching()
+        m.add_edge(0, 1, weight=1.0, fault_ids=0)
+        m.add_boundary_edge(0, weight=3.0, fault_ids=1)
+        m.add_boundary_edge(1, weight=3.0, fault_ids=2)
+
+        # Call 1: second spec fails validation -> stale entry for edge (0,1)
+        # holding original_weight=1.0 (before the fix).
+        with pytest.raises(ValueError, match="does not exist"):
+            m.decode(np.array([1, 1]),
+                     edge_reweights=np.array([[0, 1, 1.5], [7, 8, 1.5]]))
+
+        # User then changes the edge's weight.
+        m.add_edge(0, 1, weight=5.0, fault_ids=0, merge_strategy="replace")
+
+        # A later reweight call that throws mid-apply must NOT replay the stale
+        # entry. (An out-of-range weight throws at validation, exercising the
+        # exception-path restore in decode's catch.)
+        with pytest.raises(ValueError):
+            m.decode(np.array([1, 1]),
+                     edge_reweights=np.array([[0, 1, 2.0**25]]))
+
+        # Edge (0,1) must still hold the user's 5.0, not the stale 1.0.
+        _, w = m.decode(np.array([1, 1]), return_weight=True)
+        oracle = Matching()
+        oracle.add_edge(0, 1, weight=5.0, fault_ids=0)
+        oracle.add_boundary_edge(0, weight=3.0, fault_ids=1)
+        oracle.add_boundary_edge(1, weight=3.0, fault_ids=2)
+        _, w_oracle = oracle.decode(np.array([1, 1]), return_weight=True)
+        assert np.isclose(w, w_oracle)
+
+    def test_decode_error_then_decode_sequence(self):
+        # decode -> rejected reweight -> decode must behave as if the rejected
+        # call never happened, in both tiers' precondition paths.
+        m = self.build()
+        pred0, w0 = m.decode(self.SYNDROME, return_weight=True)
+        for bad in ([[0, 1, float("nan")]], [[0, 1, 2.0**25]], [[0, 999, 0.5]]):
+            with pytest.raises(ValueError):
+                m.decode(self.SYNDROME, edge_reweights=np.array(bad))
+            pred, w = m.decode(self.SYNDROME, return_weight=True)
+            assert np.array_equal(pred, pred0)
+            assert np.isclose(w, w0)
+        # And a good reweight still works after all the failures.
+        _, w_rw = m.decode(self.SYNDROME, edge_reweights=np.array([[0, 1, 0.4]]),
+                           return_weight=True)
+        assert not np.isclose(w_rw, w0)
+        self.assert_unchanged(m)
+
     def test_stride_overflow_rejected(self):
         # stride = 2**63 + 4 with 2 rules: the product wraps mod 2**64 to 8,
         # which used to pass the multiplication-based validation and silently
