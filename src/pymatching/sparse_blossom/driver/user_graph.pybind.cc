@@ -230,8 +230,9 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                 // the persistent _mwpm member, rebuilt in place, so it needs no
                 // re-binding.
                 if (has_reweights) {
-                    self.apply_reweights(
-                        reweight_specs, self.needs_regeneration(reweight_specs), enable_correlations);
+                    auto parsed = self.parse_reweight_specs(reweight_specs);
+                    bool regen = self.needs_regeneration(parsed);
+                    self.apply_reweights(std::move(parsed), regen, enable_correlations);
                 }
 
                 // Perform decoding
@@ -385,7 +386,8 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
             // mutates the UserGraph (Tier 2) is always undone by a matching
             // Tier-2 restore -- including on the exception path.
             std::vector<char> block_needs_regen;
-            std::vector<std::vector<std::array<double, 3>>> all_reweight_specs;
+            std::vector<char> rule_has_reweights;
+            std::vector<std::vector<pm::EdgeReweight>> all_parsed_reweights;
 
             if (has_reweights) {
                 py::list reweights_list = edge_reweights.cast<py::list>();
@@ -406,15 +408,20 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                         "). These must be equal.");
                 }
 
-                all_reweight_specs.resize(num_rules);
+                all_parsed_reweights.resize(num_rules);
 
-                // Prepare all reweight specs (one per rule, not per shot)
+                // Parse and fully validate every rule up front (one per rule, not
+                // per shot), so a malformed rule surfaces before ANY shot is
+                // decoded rather than mid-batch at its block's apply. The parsed
+                // entries capture each edge's current weight; they remain valid at
+                // every block's apply because Tier-2 restores write the original
+                // floats back bit-exactly between blocks.
                 for (py::ssize_t rule = 0; rule < reweights_list.size(); rule++) {
                     py::object rule_reweights_obj = reweights_list[rule];
 
                     // Handle None values - skip rules without reweights
                     if (rule_reweights_obj.is_none()) {
-                        // Leave all_reweight_specs[rule] empty (already initialized as empty vector)
+                        // Leave all_parsed_reweights[rule] empty (already initialized as empty vector)
                         continue;
                     }
 
@@ -422,14 +429,16 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                     validate_reweights_array(rule_reweights);
                     auto reweights_unchecked = rule_reweights.unchecked<2>();
 
+                    std::vector<std::array<double, 3>> raw_specs;
+                    raw_specs.reserve(reweights_unchecked.shape(0));
                     for (py::ssize_t j = 0; j < reweights_unchecked.shape(0); j++) {
-                        std::array<double, 3> spec = {
+                        raw_specs.push_back({
                             reweights_unchecked(j, 0),
                             reweights_unchecked(j, 1),
                             reweights_unchecked(j, 2)
-                        };
-                        all_reweight_specs[rule].push_back(spec);
+                        });
                     }
+                    all_parsed_reweights[rule] = self.parse_reweight_specs(raw_specs);
                 }
 
                 // Decide, per block, whether it needs regeneration (i.e. some reweight
@@ -446,9 +455,15 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                 // externally supplied max (not currently exposed). In-range reweights
                 // (all Tier-1, including all erasure) are unaffected and stay fast.
                 block_needs_regen.assign(num_rules, 0);
+                // rule_has_reweights is recorded BEFORE the decode loop because a
+                // block's apply MOVES its parsed vector into the UserGraph,
+                // leaving all_parsed_reweights[r] empty -- the restore gate at the
+                // block's last shot must not read the moved-from vector.
+                rule_has_reweights.assign(num_rules, 0);
                 for (size_t r = 0; r < num_rules; r++) {
-                    if (!all_reweight_specs[r].empty())
-                        block_needs_regen[r] = self.needs_regeneration(all_reweight_specs[r]) ? 1 : 0;
+                    rule_has_reweights[r] = all_parsed_reweights[r].empty() ? 0 : 1;
+                    if (rule_has_reweights[r])
+                        block_needs_regen[r] = self.needs_regeneration(all_parsed_reweights[r]) ? 1 : 0;
                 }
             }
 
@@ -473,9 +488,10 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                     // and this block's own Tier-2 apply), so no get_mwpm() refresh
                     // is needed here or per shot. `mwpm` is a reference to the
                     // persistent _mwpm member, so it reflects rebuilt graphs.
-                    if (has_reweights && is_first_shot_in_block && !all_reweight_specs[rule_idx].empty()) {
+                    if (has_reweights && is_first_shot_in_block && rule_has_reweights[rule_idx]) {
                         self.apply_reweights(
-                            all_reweight_specs[rule_idx], block_needs_regen[rule_idx], enable_correlations);
+                            std::move(all_parsed_reweights[rule_idx]), block_needs_regen[rule_idx],
+                            enable_correlations);
                     }
 
                     // Extract detection events for this shot
@@ -544,7 +560,7 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                     // (which mutated the UserGraph) is always undone by a Tier-2
                     // restore, and it re-materialises the graph so the next block --
                     // including one with no reweights -- sees the restored graph.
-                    if (has_reweights && is_last_shot_in_block && !all_reweight_specs[rule_idx].empty()) {
+                    if (has_reweights && is_last_shot_in_block && rule_has_reweights[rule_idx]) {
                         self.restore_weights();
                     }
                 }

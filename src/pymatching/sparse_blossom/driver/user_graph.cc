@@ -569,47 +569,17 @@ pm::UserGraph pm::detector_error_model_to_user_graph(
     return user_graph;
 }
 
-void pm::UserGraph::apply_reweights(
-    const std::vector<std::array<double, 3>>& reweight_specs, bool needs_regeneration, bool ensure_search_graph) {
-    // Reject reweighting on graphs with any negative edge weight: the matching
-    // graph stores abs(weight) in the slot plus baked-in compensation (virtual
-    // detection events, pre-flipped observables, negative_weight_sum) that an
-    // in-place Tier-1 write cannot maintain. The check reads the UserGraph FLOAT
-    // weights, so it is uniform: it cannot be parity-cancelled by cycles of
-    // negative edges (the old detection-events check) and does not depend on
-    // whether a tiny negative weight happens to discretize to 0 (the discretized
-    // negative_weight_sum). Checked before materialising, so a rejected call
-    // does no graph work.
-    if (edge_stats().has_negative_weight) {
-        throw std::invalid_argument("Edge reweighting not supported with negative edge weights");
-    }
-
-    // Materialise the graph in the requested shape before touching anything, so
-    // any regeneration still pending (e.g. from a previous Tier-2 restore or a
-    // graph mutation) is applied and the Tier-1 snapshots below target the
-    // up-to-date graph. O(1) when nothing is pending.
-    pm::Mwpm& mwpm = ensure_search_graph ? get_mwpm_with_search_graph() : get_mwpm();
-
-    // Preserve an already-present search graph across Tier-2 rebuilds even when
-    // this decode doesn't need it: rebuilding without it would force the next
-    // correlations consumer (decode_to_edges_array, shortest-path queries) to pay
-    // a full rebuild, ping-ponging shapes on mixed workloads. This shape is also
-    // recorded at commit time so restore re-materialises in the shape THIS apply
-    // established, rather than probing.
-    bool with_search_graph = ensure_search_graph ||
-        (mwpm.flooder.graph.nodes.size() > 0 &&
-         mwpm.search_flooder.graph.nodes.size() == mwpm.flooder.graph.nodes.size());
-
-    // Validate into a local vector and commit to _active_reweights only after the
-    // whole spec list has passed (strong exception guarantee). A throw part-way
-    // through must leave _active_reweights untouched: stale partial entries from a
+std::vector<pm::EdgeReweight> pm::UserGraph::parse_reweight_specs(
+    const std::vector<std::array<double, 3>>& reweight_specs) {
+    // Parses into a local vector; the caller commits it via apply_reweights only
+    // after every spec has passed (strong exception guarantee). A throw part-way
+    // through leaves _active_reweights untouched: stale partial entries from a
     // failed call would otherwise be replayed into the graph by a later
     // exception-path restore_weights, silently overwriting weights the user set
     // in the meantime.
     std::vector<EdgeReweight> validated;
     validated.reserve(reweight_specs.size());
 
-    // Validate and prepare reweights
     for (const auto& spec : reweight_specs) {
         // Node indices arrive as user-supplied doubles; ensure the value is safely
         // castable BEFORE any cast. Casting a negative, non-finite, non-integral,
@@ -686,11 +656,48 @@ void pm::UserGraph::apply_reweights(
         validated.push_back(reweight);
     }
 
-    // Every spec validated; commit, recording the tier so restore_weights can
-    // only ever undo with the tier that was applied. From here on nothing throws
-    // before the apply completes (Tier-1 writes discretized ints; Tier-2 writes
-    // UserGraph floats for edges the validation loop just resolved).
-    _active_reweights = std::move(validated);
+    return validated;
+}
+
+void pm::UserGraph::apply_reweights(
+    std::vector<EdgeReweight>&& parsed_reweights, bool needs_regeneration, bool ensure_search_graph) {
+    // Reject reweighting on graphs with any negative edge weight: the matching
+    // graph stores abs(weight) in the slot plus baked-in compensation (virtual
+    // detection events, pre-flipped observables, negative_weight_sum) that an
+    // in-place Tier-1 write cannot maintain. The check reads the UserGraph FLOAT
+    // weights, so it is uniform: it cannot be parity-cancelled by cycles of
+    // negative edges (the old detection-events check) and does not depend on
+    // whether a tiny negative weight happens to discretize to 0 (the discretized
+    // negative_weight_sum). Checked before materialising, so a rejected call
+    // does no graph work.
+    if (edge_stats().has_negative_weight) {
+        throw std::invalid_argument("Edge reweighting not supported with negative edge weights");
+    }
+
+    // Materialise the graph in the requested shape before touching anything, so
+    // any regeneration still pending (e.g. from a previous Tier-2 restore or a
+    // graph mutation) is applied and the Tier-1 snapshots below target the
+    // up-to-date graph. O(1) when nothing is pending.
+    pm::Mwpm& mwpm = ensure_search_graph ? get_mwpm_with_search_graph() : get_mwpm();
+
+    // Preserve an already-present search graph across Tier-2 rebuilds even when
+    // this decode doesn't need it: rebuilding without it would force the next
+    // correlations consumer (decode_to_edges_array, shortest-path queries) to pay
+    // a full rebuild, ping-ponging shapes on mixed workloads. This shape is also
+    // recorded at commit time so restore re-materialises in the shape THIS apply
+    // established, rather than probing.
+    bool with_search_graph = ensure_search_graph ||
+        (mwpm.flooder.graph.nodes.size() > 0 &&
+         mwpm.search_flooder.graph.nodes.size() == mwpm.flooder.graph.nodes.size());
+
+    // Commit, recording the tier so restore_weights can only ever undo with the
+    // tier that was applied. Nothing above mutated reweight state, so a throw
+    // from the guard leaves _active_reweights untouched (strong guarantee,
+    // paired with parse_reweight_specs validating before anything is committed).
+    // From here on nothing throws before the apply completes (Tier-1 writes
+    // discretized ints; Tier-2 writes UserGraph floats for edges the parse just
+    // resolved).
+    _active_reweights = std::move(parsed_reweights);
     _active_reweights_regen = needs_regeneration;
     _active_reweights_with_search = with_search_graph;
 
@@ -808,7 +815,7 @@ bool pm::UserGraph::all_edges_integral() const {
     return edge_stats().all_integral;
 }
 
-bool pm::UserGraph::needs_regeneration(const std::vector<std::array<double, 3>>& reweight_specs) {
+bool pm::UserGraph::needs_regeneration(const std::vector<EdgeReweight>& parsed_reweights) {
     // Compare against the SAME maximum the normalising constant is sized by:
     // get_edge_weight_normalising_constant takes the max over edges AND implied
     // correlation weights. Using the edge-only max would needlessly classify
@@ -841,39 +848,35 @@ bool pm::UserGraph::needs_regeneration(const std::vector<std::array<double, 3>>&
         return false;
     };
 
-    for (const auto& spec : reweight_specs) {
-        double new_weight = spec[2];
-        if (graph_all_integral && round(new_weight) != new_weight)
+    for (const auto& rw : parsed_reweights) {
+        if (graph_all_integral && round(rw.new_weight) != rw.new_weight)
             return true;
         // Regeneration is also required when a reweight exceeds the original max,
         // which changes the normalising constant.
-        max_new_abs_weight = std::max(max_new_abs_weight, std::abs(new_weight));
+        max_new_abs_weight = std::max(max_new_abs_weight, std::abs(rw.new_weight));
 
         // Slot-ambiguity rules: force regeneration when the spec touches an edge
         // with no dedicated in-place slot, where a Tier-1 write would silently
         // no-op or corrupt shared state. Regeneration re-derives the discretized
         // graph from the UserGraph (including boundary min-merging), so it
-        // handles all of these exactly. Node values are interpreted only when
-        // castable; malformed specs are left for apply_reweights to reject.
-        double n1_raw = spec[0], n2_raw = spec[1];
-        bool n1_castable =
-            std::isfinite(n1_raw) && n1_raw >= 0 && round(n1_raw) == n1_raw && n1_raw < (double)nodes.size();
-        if (!n1_castable)
-            continue;
-        size_t node1 = (size_t)n1_raw;
-        if (n2_raw == -1.0) {
+        // handles all of these exactly. parse_reweight_specs guarantees the edge
+        // exists, so the node indices are in range.
+        // TODO(deeper): these rules hand-mirror iter_discretized_edges' boundary
+        // routing and min-merge policy (user_graph.h). If that build policy
+        // changes, update these to match -- or better, record slot dedication at
+        // build time and expose an edge_has_dedicated_slot() query for this
+        // check to consume.
+        if (rw.node2 == SIZE_MAX) {
             // Explicit boundary edge (u,-1): its discretized slot is shared with
             // any edge (u,v) where v is a boundary node (min-merged), and it has
             // no slot at all if u is itself a boundary node.
-            if (nodes[node1].is_boundary || has_boundary_node_neighbor(node1))
+            if (nodes[rw.node1].is_boundary || has_boundary_node_neighbor(rw.node1))
                 return true;
-        } else if (
-            std::isfinite(n2_raw) && n2_raw >= 0 && round(n2_raw) == n2_raw && n2_raw < (double)nodes.size()) {
+        } else {
             // Edge (u,v): if either endpoint is a boundary node, the edge is
             // stored as a nullptr boundary slot at the other endpoint (or not at
             // all), which the Tier-1 pointer lookup cannot address.
-            size_t node2 = (size_t)n2_raw;
-            if (nodes[node1].is_boundary || nodes[node2].is_boundary)
+            if (nodes[rw.node1].is_boundary || nodes[rw.node2].is_boundary)
                 return true;
         }
     }

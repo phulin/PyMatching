@@ -154,19 +154,27 @@ class UserGraph {
         std::map<std::pair<size_t, size_t>, std::map<std::pair<size_t, size_t>, double>>& joint_probabilites);
 
     // Edge reweighting methods.
-    /// Apply per-shot reweights. `needs_regeneration` selects the tier (the caller
+    /// Parse and fully validate raw [node1, node2, weight] reweight specs into
+    /// EdgeReweight entries, resolving the -1 boundary sentinel and capturing
+    /// each edge's current weight. Throws std::invalid_argument on any malformed
+    /// spec or nonexistent edge; touches no graph state. This is the SINGLE
+    /// parser of the wire format, consumed by both needs_regeneration and
+    /// apply_reweights, so tier classification and application can never
+    /// interpret a spec differently.
+    std::vector<EdgeReweight> parse_reweight_specs(const std::vector<std::array<double, 3>>& reweight_specs);
+    /// Apply parsed reweights. `needs_regeneration` selects the tier (the caller
     /// decides it -- decode_batch must precompute per-block tiers against the
     /// unmutated graph); `ensure_search_graph` selects the graph shape to
     /// materialise (pass enable_correlations). Materialises the graph itself:
     /// callers need no get_mwpm() refresh before or after.
     void apply_reweights(
-        const std::vector<std::array<double, 3>>& reweight_specs,
+        std::vector<EdgeReweight>&& parsed_reweights,
         bool needs_regeneration,
         bool ensure_search_graph);
     /// Undo the last apply_reweights, using the tier recorded at apply time (a
     /// mismatched tier pair is unrepresentable). No-op if nothing is applied.
     void restore_weights();
-    bool needs_regeneration(const std::vector<std::array<double, 3>>& reweight_specs);
+    bool needs_regeneration(const std::vector<EdgeReweight>& parsed_reweights);
 
     /// Invalidate the cached per-edge aggregate stats (call whenever edge weights
     /// or implied weights are modified).
