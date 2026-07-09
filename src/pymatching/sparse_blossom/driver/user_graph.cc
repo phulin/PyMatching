@@ -819,17 +819,40 @@ void pm::UserGraph::restore_weights(bool needs_regeneration) {
     _active_reweights.clear();
 }
 
+bool pm::UserGraph::all_edges_integral() const {
+    for (const auto& e : edges) {
+        if (round(e.weight) != e.weight)
+            return false;
+        for (const auto& implied : e.implied_weights_for_other_edges) {
+            if (round(implied.implied_weight) != implied.implied_weight)
+                return false;
+        }
+    }
+    return true;
+}
+
 bool pm::UserGraph::needs_regeneration(const std::vector<std::array<double, 3>>& reweight_specs) {
     double original_max_abs_weight = max_abs_weight();
-    double max_abs_weight = original_max_abs_weight;
+    double max_new_abs_weight = original_max_abs_weight;
 
-    // Find maximum weight among the reweight specifications
+    // When the current graph is all-integral, get_edge_weight_normalising_constant
+    // collapses to 1.0, so the matching graph is discretized at integer resolution.
+    // An in-place (Tier-1) reweight to a non-integer value would then be silently
+    // rounded to the nearest integer (e.g. 0.1 -> a free edge). Force a full
+    // regeneration in that case: the reweighted, now non-integral edge makes
+    // all_integral_weight false, rescaling the constant to fine resolution.
+    bool graph_all_integral = all_edges_integral();
+
+    // Find the maximum reweight magnitude (regeneration is also required when a
+    // reweight exceeds the original max, which changes the normalising constant).
     for (const auto& spec : reweight_specs) {
         double new_weight = spec[2];
-        max_abs_weight = std::max(max_abs_weight, std::abs(new_weight));
+        if (graph_all_integral && round(new_weight) != new_weight)
+            return true;
+        max_new_abs_weight = std::max(max_new_abs_weight, std::abs(new_weight));
     }
 
-    return max_abs_weight > original_max_abs_weight;
+    return max_new_abs_weight > original_max_abs_weight;
 }
 
 bool pm::UserGraph::batch_needs_regeneration(const std::vector<std::vector<std::array<double, 3>>>& all_reweight_specs) {

@@ -635,6 +635,36 @@ class TestEdgeReweighting:
         assert np.isclose(ws[1], w1)
         assert np.isclose(ws[1], 2.0)
 
+    def test_fractional_reweight_on_integer_graph(self):
+        """Regression for the discretization-resolution gap.
+
+        On an all-integer-weight graph the normalising constant collapses to 1.0,
+        so the matching graph has integer-only resolution. A fractional reweight
+        applied in place (Tier 1) would be silently rounded to the nearest integer
+        (e.g. 0.1 -> a free, weight-0 edge). needs_regeneration must instead force a
+        full regeneration (Tier 2) so the graph is rebuilt at fine resolution, and
+        the result must match a matcher built from scratch with the fractional edge.
+        """
+        def build(edge01):
+            m = Matching()
+            m.add_edge(0, 1, weight=edge01, fault_ids=0)   # all-integer base -> nc == 1
+            m.add_boundary_edge(0, weight=1.0, fault_ids=1)
+            m.add_boundary_edge(1, weight=1.0, fault_ids=2)
+            return m
+
+        syndrome = np.array([1, 1])
+        for v in (0.1, 0.6, 1.4):
+            corr, weight = build(1.0).decode(
+                syndrome,
+                edge_reweights=np.array([[0, 1, v]], dtype=np.float64),
+                return_weight=True,
+            )
+            # Oracle: built from scratch with the fractional edge (fine resolution).
+            corr_oracle, weight_oracle = build(v).decode(syndrome, return_weight=True)
+            np.testing.assert_array_equal(corr, corr_oracle)
+            assert np.isclose(weight, weight_oracle, atol=1e-5)
+            assert np.isclose(weight, v, atol=1e-5)  # not rounded to an integer
+
 
 if __name__ == "__main__":
     pytest.main([__file__])

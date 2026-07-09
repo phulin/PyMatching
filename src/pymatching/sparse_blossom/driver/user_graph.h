@@ -138,6 +138,11 @@ class UserGraph {
     bool all_edges_have_error_probabilities();
     double max_abs_weight();
     double get_edge_weight_normalising_constant(size_t max_num_distinct_weights);
+    /// Returns true iff every edge weight (and implied weight) is an integer. In that
+    /// case get_edge_weight_normalising_constant collapses to 1.0, giving integer-only
+    /// discretization resolution -- so a fractional reweight cannot be represented in
+    /// place and must trigger a full regeneration (see needs_regeneration).
+    bool all_edges_integral() const;
     template <typename EdgeCallable, typename BoundaryEdgeCallable>
     double iter_discretized_edges(
         pm::weight_int num_distinct_weights,
