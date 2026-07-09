@@ -14,6 +14,9 @@
 
 #include "pymatching/sparse_blossom/driver/user_graph.pybind.h"
 
+#include <cstring>
+#include <limits>
+
 #include "pybind11/pybind11.h"
 #include "pymatching/sparse_blossom/driver/mwpm_decoding.h"
 #include "pymatching/sparse_blossom/driver/user_graph.h"
@@ -311,7 +314,7 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
            bool enable_correlations,
            py::object edge_reweights = py::none(),
            size_t reweight_stride = 1,
-           bool logical_error_if_no_matching = false) {
+           bool return_no_matching = false) {
             if (shots.ndim() != 2)
                 throw std::invalid_argument(
                     "`shots` array should have two dimensions, not " + std::to_string(shots.ndim()));
@@ -345,6 +348,12 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
             // Reserve weights array
             py::array_t<double> weights = py::array_t<double>(shots.shape(0));
             auto ws = weights.mutable_unchecked<1>();
+
+            // Per-shot flag: 1 where the shot had no perfect matching. Always allocated
+            // (like `weights`); the Python layer returns it only when requested.
+            py::array_t<uint8_t> no_matching = py::array_t<uint8_t>(shots.shape(0));
+            no_matching[py::make_tuple(py::ellipsis())] = 0;
+            auto nm = no_matching.mutable_unchecked<1>();
 
             auto &mwpm = enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm();
             std::vector<uint64_t> detection_events;
@@ -497,13 +506,17 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                                 enable_correlations);
                         }
                         ws(i) = (double)solution_weight / mwpm.flooder.graph.normalising_constant;
-                    } catch (const std::invalid_argument&) {
-                        if (!logical_error_if_no_matching) throw;
-                        // No perfect matching: predict every observable flipped so the shot
-                        // registers as a logical error. Honour the prediction format -- one
-                        // byte per observable (value 1) when unpacked, or exactly the low
-                        // num_observables bits when packed -- rather than 0xFF, which would
-                        // emit non-binary 255s (unpacked) and set garbage high bits (packed).
+                    } catch (const pm::NoPerfectMatchingError&) {
+                        // Only this specific condition is handled here -- other input errors
+                        // (e.g. an out-of-range detector index) still propagate. Re-raise
+                        // unless the caller opted into flagging via return_no_matching.
+                        if (!return_no_matching) throw;
+                        nm(i) = 1;
+                        // Predict every observable flipped so the shot registers as a logical
+                        // error for callers that only inspect predictions. Honour the format:
+                        // one byte per observable (value 1) unpacked, or the low
+                        // num_observables bits when packed (never 0xFF, which emits non-binary
+                        // 255s and sets garbage high bits).
                         uint8_t *pred = predictions_ptr + (num_observable_bytes * i);
                         if (bit_packed_predictions) {
                             for (size_t k = 0; k < self.get_num_observables(); k++)
@@ -511,7 +524,9 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                         } else {
                             std::memset(pred, 1, num_observable_bytes);
                         }
-                        ws(i) = 0.0;
+                        // No valid solution exists: report infinite weight, not 0.0 (which is a
+                        // real, perfect decode).
+                        ws(i) = std::numeric_limits<double>::infinity();
                     }
                     detection_events.clear();
 
@@ -524,7 +539,7 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                 }
 
                 predictions.resize({(py::ssize_t)shots.shape(0), (py::ssize_t)num_observable_bytes});
-                return py::make_tuple(predictions, weights);
+                return py::make_tuple(predictions, weights, no_matching);
 
             } catch (...) {
                 // Ensure weights are restored even on exception, using the in-flight
@@ -541,7 +556,7 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
         "enable_correlations"_a = false,
         "edge_reweights"_a = py::none(),
         "reweight_stride"_a = 1,
-        "logical_error_if_no_matching"_a = false);
+        "return_no_matching"_a = false);
     g.def(
         "decode_to_matched_detection_events_dict",
         [](pm::UserGraph &self, const py::array_t<uint64_t> &detection_events) {

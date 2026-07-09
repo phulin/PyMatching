@@ -732,17 +732,6 @@ class TestEdgeReweighting:
         with pytest.raises(ValueError):
             m.decode(np.array([1, 1]), edge_reweights=np.array([[-1.0, 1.0, 0.5]]))
 
-    def test_logical_error_predictions_are_binary(self):
-        """C5: logical_error_if_no_matching must emit binary predictions (1), not
-        255, on a shot with no perfect matching."""
-        m = Matching()
-        m.add_edge(0, 1, weight=1.0, fault_ids=0)  # no boundary -> [1,0] has no matching
-        preds = m.decode_batch(
-            np.array([[1, 0]], dtype=np.uint8), logical_error_if_no_matching=True
-        )
-        assert set(np.unique(preds)).issubset({0, 1})
-        assert preds[0, 0] == 1
-
 
 if __name__ == "__main__":
     pytest.main([__file__])

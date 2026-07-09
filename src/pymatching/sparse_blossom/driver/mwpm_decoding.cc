@@ -139,7 +139,7 @@ void process_timeline_until_completion(pm::Mwpm& mwpm, const std::vector<uint64_
     // If some alternating tree nodes remain, a perfect matching cannot be found
     if (mwpm.node_arena.allocated.size() != mwpm.node_arena.available.size()) {
         mwpm.reset();
-        throw std::invalid_argument(
+        throw pm::NoPerfectMatchingError(
             "No perfect matching could be found. This likely means that the syndrome has odd "
             "parity in the support of a connected component without a boundary.");
     }
