@@ -382,14 +382,18 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                 size_t num_rules = reweights_list.size();
                 size_t num_shots = shots.shape(0);
 
-                // Validate stride × num_rules == num_shots
-                if (reweight_stride * num_rules != num_shots) {
+                // Validate stride × num_rules == num_shots. Phrased with division so
+                // the check cannot wrap: the naive size_t multiply overflows mod 2^64
+                // for a huge stride, letting it pass validation while rule_idx
+                // (i / stride) then maps every shot to rule 0, silently ignoring the
+                // remaining rules.
+                if (num_rules == 0 ? num_shots != 0
+                                   : (num_shots % num_rules != 0 || reweight_stride != num_shots / num_rules)) {
                     throw std::invalid_argument(
                         "reweight_stride (" + std::to_string(reweight_stride) +
                         ") × number of reweight rules (" + std::to_string(num_rules) +
-                        ") = " + std::to_string(reweight_stride * num_rules) +
-                        ", but number of shots is " + std::to_string(num_shots) +
-                        ". These must be equal.");
+                        ") must equal the number of shots (" + std::to_string(num_shots) +
+                        "). These must be equal.");
                 }
 
                 all_reweight_specs.resize(num_rules);

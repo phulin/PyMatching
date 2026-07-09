@@ -802,5 +802,77 @@ class TestEdgeReweighting:
         assert np.isclose(ws[1], w1)
 
 
+class TestReweightInputValidation:
+    """Malformed reweight specs must raise cleanly, leaving the matcher untouched.
+
+    Before these guards, non-finite or out-of-range doubles hit undefined
+    double->size_t / double->weight_int casts: on arm64 a NaN node index silently
+    reweighted node 0, 1e30 saturated to SIZE_MAX (the boundary sentinel) and
+    silently reweighted the boundary edge, a fractional index truncated to the
+    wrong node, and a NaN weight made the edge decode as free (weight 0.0).
+    """
+
+    SYNDROME = np.array([1, 1, 0])
+
+    @staticmethod
+    def build():
+        m = Matching()
+        m.add_edge(0, 1, weight=1.3, fault_ids=0)
+        m.add_edge(1, 2, weight=1.1, fault_ids=1)
+        m.add_boundary_edge(0, weight=2.7, fault_ids=2)
+        m.add_boundary_edge(2, weight=2.7, fault_ids=3)
+        return m
+
+    def assert_unchanged(self, m):
+        pristine_pred, pristine_w = self.build().decode(self.SYNDROME, return_weight=True)
+        pred, w = m.decode(self.SYNDROME, return_weight=True)
+        assert np.array_equal(pred, pristine_pred)
+        assert np.isclose(w, pristine_w)
+
+    @pytest.mark.parametrize("bad_weight", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_weight_raises(self, bad_weight):
+        m = self.build()
+        with pytest.raises(ValueError, match="finite|non-negative"):
+            m.decode(self.SYNDROME, edge_reweights=np.array([[0, 1, bad_weight]]))
+        self.assert_unchanged(m)
+
+    def test_over_max_weight_raises_and_matcher_survives(self):
+        # 2**25 > MAX_USER_EDGE_WEIGHT (16777215). Previously this took Tier-2,
+        # mutated the UserGraph, and threw during regeneration BEFORE the
+        # restore-guaranteeing try block -- permanently bricking the matcher.
+        m = self.build()
+        with pytest.raises(ValueError, match="maximum edge weight"):
+            m.decode(self.SYNDROME, edge_reweights=np.array([[0, 1, 2.0**25]]))
+        self.assert_unchanged(m)
+
+    @pytest.mark.parametrize("bad_node", [float("nan"), float("inf"), 1e30, 2.7])
+    @pytest.mark.parametrize("position", [0, 1])
+    def test_bad_node_index_raises(self, bad_node, position):
+        m = self.build()
+        spec = [0.0, 1.0, 0.5]
+        spec[position] = bad_node
+        with pytest.raises(ValueError, match="non-negative integer|exactly -1"):
+            m.decode(self.SYNDROME, edge_reweights=np.array([spec]))
+        self.assert_unchanged(m)
+
+    def test_node_index_out_of_range_raises(self):
+        # In-range-castable but nonexistent nodes keep the pre-existing error.
+        m = self.build()
+        with pytest.raises(ValueError, match="does not exist"):
+            m.decode(self.SYNDROME, edge_reweights=np.array([[0, 999, 0.5]]))
+        self.assert_unchanged(m)
+
+    def test_stride_overflow_rejected(self):
+        # stride = 2**63 + 4 with 2 rules: the product wraps mod 2**64 to 8,
+        # which used to pass the multiplication-based validation and silently
+        # decode every shot under rule 0.
+        m = self.build()
+        shots = np.zeros((8, 3), dtype=np.uint8)
+        rules = [np.array([[0, 1, 0.5]]), np.array([[1, 2, 0.9]])]
+        with pytest.raises(ValueError, match="must be equal"):
+            m.decode_batch(shots, edge_reweights=rules, reweight_stride=2**63 + 4)
+        self.assert_unchanged(m)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

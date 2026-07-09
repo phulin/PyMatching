@@ -568,29 +568,50 @@ void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& re
 
     // Validate and prepare reweights
     for (const auto& spec : reweight_specs) {
-        // spec[0] is a user-supplied double; guard the unsigned conversion, since a
-        // negative or non-finite value is undefined behaviour when cast to size_t.
-        if (spec[0] < 0 || !std::isfinite(spec[0]))
-            throw std::invalid_argument("Reweight node1 index must be a non-negative integer");
+        // Node indices arrive as user-supplied doubles; ensure the value is safely
+        // castable BEFORE any cast. Casting a negative, non-finite, non-integral, or
+        // >= 2^64 double to size_t is undefined behaviour and silently "succeeds"
+        // with garbage on most platforms (e.g. on arm64 NaN converts to node 0,
+        // 1e30 saturates to SIZE_MAX -- the boundary sentinel -- and 2.7 truncates
+        // to node 2), reweighting the wrong edge with no error. In-range but
+        // nonexistent nodes fall through to the "Edge does not exist" check below,
+        // preserving the pre-existing error for that case.
+        auto validate_node_index = [](double v, const char* which) {
+            if (!std::isfinite(v) || v < 0 || round(v) != v || v >= 18446744073709551616.0 /* 2^64 */)
+                throw std::invalid_argument(
+                    std::string("Reweight ") + which + " must be a finite non-negative integer, got " +
+                    std::to_string(v));
+        };
+        validate_node_index(spec[0], "node1");
         size_t node1 = (size_t)spec[0];
         double node2_raw = spec[1];
         size_t node2;
 
-        // Validate boundary edge format first
+        // Validate boundary edge format first. (NaN < 0 is false, so non-finite
+        // values fall through to validate_node_index below.)
         if (node2_raw < 0) {
             if (node2_raw != -1.0) {
                 throw std::invalid_argument("Boundary edges must use exactly -1 as second node");
             }
             node2 = SIZE_MAX;
         } else {
+            validate_node_index(node2_raw, "node2");
             node2 = (size_t)node2_raw;
         }
 
         double new_weight = spec[2];
 
-        // Validate new weight is non-negative
-        if (new_weight < 0) {
-            throw std::invalid_argument("Reweight values must be non-negative");
+        // Reject negative, non-finite, and over-max weights before any state is
+        // touched. NaN would otherwise pass a plain `< 0` check and reach an
+        // out-of-range double->weight_int cast (UB) in the Tier-1 discretization;
+        // weights above MAX_USER_EDGE_WEIGHT would throw later, mid-regeneration.
+        if (new_weight < 0 || !std::isfinite(new_weight)) {
+            throw std::invalid_argument("Reweight values must be finite and non-negative");
+        }
+        if (new_weight > pm::MAX_USER_EDGE_WEIGHT) {
+            throw std::invalid_argument(
+                "Reweight value " + std::to_string(new_weight) + " exceeds the maximum edge weight " +
+                std::to_string(pm::MAX_USER_EDGE_WEIGHT));
         }
 
         // Find existing edge and store original weight
