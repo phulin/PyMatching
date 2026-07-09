@@ -57,25 +57,6 @@ struct EdgeReweight {
     weight_int new_normalized_weight;
 };
 
-/// Cached edge indices for fast lookup during reweighting
-struct EdgeIndexCache {
-    size_t matching_graph_node1_neighbor_idx;
-    size_t matching_graph_node2_neighbor_idx;  // SIZE_MAX if boundary edge
-    size_t search_graph_node1_neighbor_idx;
-    size_t search_graph_node2_neighbor_idx;    // SIZE_MAX if boundary edge
-    size_t user_graph_neighbor_idx;            // Index in UserGraph adjacency list
-};
-
-/// Hash function for pair<size_t, size_t> to use in unordered_map
-struct PairHash {
-    size_t operator()(const std::pair<size_t, size_t>& p) const {
-        // Use a simple hash combining technique
-        size_t h1 = std::hash<size_t>{}(p.first);
-        size_t h2 = std::hash<size_t>{}(p.second);
-        return h1 ^ (h2 << 1);
-    }
-};
-
 struct UserNeighbor {
     std::list<UserEdge>::iterator edge_it;
     uint8_t pos{};  // The position of the neighboring node in the edge (either 0 if node1, or 1 if node2)
@@ -172,9 +153,6 @@ class UserGraph {
     bool needs_regeneration(const std::vector<std::array<double, 3>>& reweight_specs);
     bool batch_needs_regeneration(const std::vector<std::vector<std::array<double, 3>>>& all_reweight_specs);
 
-    /// Prepare batch reweights by pre-validating and caching edge indices for all unique edges
-    void prepare_batch_reweights(const std::vector<std::vector<std::array<double, 3>>>& all_reweight_specs, pm::Mwpm& mwpm);
-
     /// Get cached max absolute weight (lazy evaluation)
     double get_cached_max_abs_weight();
 
@@ -190,12 +168,6 @@ class UserGraph {
     // Reweighting state
     std::vector<EdgeReweight> _active_reweights;
 
-    // Optimization 1: Pre-computed edge index lookup table
-    // Maps (min(node1, node2), max(node1, node2)) -> EdgeIndexCache
-    // For boundary edges, node2 is SIZE_MAX
-    std::unordered_map<std::pair<size_t, size_t>, EdgeIndexCache, PairHash> _edge_index_cache;
-    bool _edge_index_cache_valid;
-
     // Optimization 3: Reusable reweight buffer to avoid heap allocations
     std::vector<EdgeReweight> _reweight_buffer;
 
@@ -207,15 +179,6 @@ class UserGraph {
     void update_existing_graph_weights();
     size_t find_neighbor_index_in_matching_graph(size_t node1, size_t node2);
     size_t find_neighbor_index_in_search_graph(size_t node1, size_t node2);
-
-    /// Build the edge index cache (called lazily on first reweight operation)
-    void build_edge_index_cache(pm::Mwpm& mwpm);
-
-    /// Get or create cached edge indices for a given edge
-    const EdgeIndexCache* get_edge_index_cache(size_t node1, size_t node2, pm::Mwpm& mwpm);
-
-    /// Create a canonical key for edge lookup (ensures consistent ordering)
-    static std::pair<size_t, size_t> make_edge_key(size_t node1, size_t node2);
 };
 
 double to_weight_for_correlations(double probability);

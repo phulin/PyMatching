@@ -176,18 +176,18 @@ void pm::UserGraph::add_or_merge_boundary_edge(
 
 pm::UserGraph::UserGraph()
     : _num_observables(0), _mwpm_needs_updating(true), _all_edges_have_error_probabilities(true),
-      _edge_index_cache_valid(false), _cached_max_abs_weight(0), _max_weight_cache_valid(false) {
+      _cached_max_abs_weight(0), _max_weight_cache_valid(false) {
 }
 
 pm::UserGraph::UserGraph(size_t num_nodes)
     : _num_observables(0), _mwpm_needs_updating(true), _all_edges_have_error_probabilities(true),
-      _edge_index_cache_valid(false), _cached_max_abs_weight(0), _max_weight_cache_valid(false) {
+      _cached_max_abs_weight(0), _max_weight_cache_valid(false) {
     nodes.resize(num_nodes);
 }
 
 pm::UserGraph::UserGraph(size_t num_nodes, size_t num_observables)
     : _num_observables(num_observables), _mwpm_needs_updating(true), _all_edges_have_error_probabilities(true),
-      _edge_index_cache_valid(false), _cached_max_abs_weight(0), _max_weight_cache_valid(false) {
+      _cached_max_abs_weight(0), _max_weight_cache_valid(false) {
     nodes.resize(num_nodes);
 }
 
@@ -201,9 +201,6 @@ void pm::UserGraph::set_boundary(const std::set<size_t>& boundary) {
         nodes[n].is_boundary = true;
     }
     _mwpm_needs_updating = true;
-    // Topology changed: a node switching boundary status resizes/reorders its neighbor
-    // arrays when the graph is rebuilt, so any cached edge-neighbor indices are stale.
-    _edge_index_cache_valid = false;
 }
 
 std::set<size_t> pm::UserGraph::get_boundary() {
@@ -229,9 +226,6 @@ bool pm::UserGraph::is_boundary_node(size_t node_id) {
 void pm::UserGraph::update_mwpm() {
     _mwpm = to_mwpm(pm::NUM_DISTINCT_WEIGHTS, false);
     _mwpm_needs_updating = false;
-    // The matching/search graphs were rebuilt; any cached edge-neighbor indices point
-    // into the old, now-freed neighbor arrays.
-    _edge_index_cache_valid = false;
 }
 
 pm::Mwpm& pm::UserGraph::get_mwpm() {
@@ -296,7 +290,6 @@ double pm::UserGraph::get_cached_max_abs_weight() {
 
 void pm::UserGraph::invalidate_max_weight_cache() {
     _max_weight_cache_valid = false;
-    _edge_index_cache_valid = false;  // Also invalidate edge index cache when graph changes
 }
 
 pm::MatchingGraph pm::UserGraph::to_matching_graph(pm::weight_int num_distinct_weights) {
@@ -376,7 +369,6 @@ pm::Mwpm& pm::UserGraph::get_mwpm_with_search_graph() {
     } else {
         _mwpm = to_mwpm(pm::NUM_DISTINCT_WEIGHTS, true);
         _mwpm_needs_updating = false;
-        _edge_index_cache_valid = false;  // rebuilt graphs invalidate cached neighbor indices
         return _mwpm;
     }
 }
@@ -551,115 +543,6 @@ pm::UserGraph pm::detector_error_model_to_user_graph(
     return user_graph;
 }
 
-// Optimization 1: Create a canonical key for edge lookup
-std::pair<size_t, size_t> pm::UserGraph::make_edge_key(size_t node1, size_t node2) {
-    // For boundary edges (node2 == SIZE_MAX), always put the real node first
-    if (node2 == SIZE_MAX) {
-        return {node1, SIZE_MAX};
-    }
-    // For regular edges, use min/max to ensure consistent ordering
-    return std::minmax(node1, node2);
-}
-
-// Optimization 1: Build the edge index cache
-void pm::UserGraph::build_edge_index_cache(pm::Mwpm& mwpm) {
-    _edge_index_cache.clear();
-
-    // Iterate through all edges in the UserGraph
-    for (size_t node_idx = 0; node_idx < nodes.size(); node_idx++) {
-        for (size_t neighbor_idx = 0; neighbor_idx < nodes[node_idx].neighbors.size(); neighbor_idx++) {
-            const auto& neighbor = nodes[node_idx].neighbors[neighbor_idx];
-            size_t other_node;
-            if (neighbor.pos == 0) {
-                other_node = neighbor.edge_it->node1;
-            } else {
-                other_node = neighbor.edge_it->node2;
-            }
-
-            auto key = make_edge_key(node_idx, other_node);
-
-            // Only process each edge once (when node_idx is the smaller node, or for boundary edges)
-            if (key.first != node_idx && other_node != SIZE_MAX) {
-                continue;
-            }
-
-            EdgeIndexCache cache;
-            cache.user_graph_neighbor_idx = neighbor_idx;
-
-            // Find matching graph indices
-            cache.matching_graph_node1_neighbor_idx = find_neighbor_index_in_matching_graph(key.first, key.second);
-            if (key.second != SIZE_MAX) {
-                cache.matching_graph_node2_neighbor_idx = find_neighbor_index_in_matching_graph(key.second, key.first);
-            } else {
-                cache.matching_graph_node2_neighbor_idx = SIZE_MAX;
-            }
-
-            // Find search graph indices (if search graph exists)
-            if (mwpm.search_flooder.graph.nodes.size() > 0) {
-                cache.search_graph_node1_neighbor_idx = find_neighbor_index_in_search_graph(key.first, key.second);
-                if (key.second != SIZE_MAX) {
-                    cache.search_graph_node2_neighbor_idx = find_neighbor_index_in_search_graph(key.second, key.first);
-                } else {
-                    cache.search_graph_node2_neighbor_idx = SIZE_MAX;
-                }
-            } else {
-                cache.search_graph_node1_neighbor_idx = SIZE_MAX;
-                cache.search_graph_node2_neighbor_idx = SIZE_MAX;
-            }
-
-            _edge_index_cache[key] = cache;
-        }
-    }
-
-    _edge_index_cache_valid = true;
-}
-
-// Optimization 1: Get or create cached edge indices
-const pm::EdgeIndexCache* pm::UserGraph::get_edge_index_cache(size_t node1, size_t node2, pm::Mwpm& mwpm) {
-    // Build cache if not valid
-    if (!_edge_index_cache_valid) {
-        build_edge_index_cache(mwpm);
-    }
-
-    auto key = make_edge_key(node1, node2);
-    auto it = _edge_index_cache.find(key);
-    if (it != _edge_index_cache.end()) {
-        return &it->second;
-    }
-    return nullptr;
-}
-
-// Optimization 4: Prepare batch reweights
-void pm::UserGraph::prepare_batch_reweights(const std::vector<std::vector<std::array<double, 3>>>& all_reweight_specs, pm::Mwpm& mwpm) {
-    // Build edge index cache if not already built
-    if (!_edge_index_cache_valid) {
-        build_edge_index_cache(mwpm);
-    }
-
-    // Pre-validate all unique edges across the batch
-    std::unordered_map<std::pair<size_t, size_t>, bool, PairHash> validated_edges;
-
-    for (const auto& shot_specs : all_reweight_specs) {
-        for (const auto& spec : shot_specs) {
-            size_t node1 = (size_t)spec[0];
-            double node2_raw = spec[1];
-            size_t node2 = (node2_raw < 0) ? SIZE_MAX : (size_t)node2_raw;
-
-            auto key = make_edge_key(node1, node2);
-            if (validated_edges.find(key) == validated_edges.end()) {
-                // Validate this edge exists
-                double original_weight;
-                if (!get_edge_or_boundary_edge_weight(node1, node2, original_weight)) {
-                    std::string node2_str = (node2 == SIZE_MAX) ? "-1" : std::to_string(node2);
-                    throw std::invalid_argument("Edge (" + std::to_string(node1) + ", " +
-                                              node2_str + ") does not exist");
-                }
-                validated_edges[key] = true;
-            }
-        }
-    }
-}
-
 void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& reweight_specs, pm::Mwpm& mwpm, bool needs_regeneration) {
     // Check graph has no negative weights
     if (!mwpm.flooder.negative_weight_detection_events.empty()) {
@@ -713,30 +596,12 @@ void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& re
         reweight.original_weight = original_weight;
         reweight.new_weight = new_weight;
 
-        // Optimization 1: Use cached edge indices if available
-        const EdgeIndexCache* cache = get_edge_index_cache(node1, node2, mwpm);
-        if (cache != nullptr) {
-            // Determine which indices to use based on node ordering
-            auto key = make_edge_key(node1, node2);
-            if (key.first == node1) {
-                reweight.matching_graph_node1_neighbor_idx = cache->matching_graph_node1_neighbor_idx;
-                reweight.matching_graph_node2_neighbor_idx = cache->matching_graph_node2_neighbor_idx;
-                reweight.search_graph_node1_neighbor_idx = cache->search_graph_node1_neighbor_idx;
-                reweight.search_graph_node2_neighbor_idx = cache->search_graph_node2_neighbor_idx;
-            } else {
-                // Swap indices since node1/node2 are reversed from the cache key
-                reweight.matching_graph_node1_neighbor_idx = cache->matching_graph_node2_neighbor_idx;
-                reweight.matching_graph_node2_neighbor_idx = cache->matching_graph_node1_neighbor_idx;
-                reweight.search_graph_node1_neighbor_idx = cache->search_graph_node2_neighbor_idx;
-                reweight.search_graph_node2_neighbor_idx = cache->search_graph_node1_neighbor_idx;
-            }
-        } else {
-            // Fallback: indices will be computed lazily
-            reweight.matching_graph_node1_neighbor_idx = SIZE_MAX;
-            reweight.matching_graph_node2_neighbor_idx = SIZE_MAX;
-            reweight.search_graph_node1_neighbor_idx = SIZE_MAX;
-            reweight.search_graph_node2_neighbor_idx = SIZE_MAX;
-        }
+        // Neighbor indices are computed lazily in update_existing_graph_weights
+        // (Tier 1 only; the O(degree) lookup is negligible next to a decode).
+        reweight.matching_graph_node1_neighbor_idx = SIZE_MAX;
+        reweight.matching_graph_node2_neighbor_idx = SIZE_MAX;
+        reweight.search_graph_node1_neighbor_idx = SIZE_MAX;
+        reweight.search_graph_node2_neighbor_idx = SIZE_MAX;
         reweight.original_normalized_weight = 0;
         reweight.new_normalized_weight = 0;
 
