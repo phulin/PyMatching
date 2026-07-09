@@ -404,8 +404,7 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                     throw std::invalid_argument(
                         "reweight_stride (" + std::to_string(reweight_stride) +
                         ") × number of reweight rules (" + std::to_string(num_rules) +
-                        ") must equal the number of shots (" + std::to_string(num_shots) +
-                        "). These must be equal.");
+                        ") must equal the number of shots (" + std::to_string(num_shots) + ").");
                 }
 
                 all_parsed_reweights.resize(num_rules);

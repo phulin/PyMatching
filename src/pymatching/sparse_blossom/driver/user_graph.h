@@ -57,7 +57,6 @@ struct EdgeReweight {
     /// writes it back verbatim (re-deriving it from original_weight risks
     /// mismatching the build-time discretization).
     weight_int original_normalized_weight;
-    weight_int new_normalized_weight;
 };
 
 struct UserNeighbor {

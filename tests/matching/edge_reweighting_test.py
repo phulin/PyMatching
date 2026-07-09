@@ -431,7 +431,7 @@ class TestEdgeReweighting:
         shots = np.array([[1, 0], [0, 1], [1, 1]], dtype=np.uint8)  # 3 shots
         reweights = [np.array([[0, 1, 0.5]], dtype=np.float64)]  # 1 rule
 
-        with pytest.raises(ValueError, match="must be equal"):
+        with pytest.raises(ValueError, match="must equal the number of shots"):
             m.decode_batch(shots, edge_reweights=reweights, reweight_stride=2)  # 2 × 1 = 2 ≠ 3
 
     def test_stride_with_none_rules(self):
@@ -955,7 +955,7 @@ class TestReweightInputValidation:
         # 64-bit size_t: the C++ division-based check raises ValueError; on a
         # 32-bit size_t build pybind rejects the argument at conversion instead.
         with pytest.raises((ValueError, TypeError),
-                           match="must be equal|incompatible function arguments"):
+                           match="must equal the number of shots|incompatible function arguments"):
             m.decode_batch(shots, edge_reweights=rules, reweight_stride=2**63 + 4)
         self.assert_unchanged(m)
 

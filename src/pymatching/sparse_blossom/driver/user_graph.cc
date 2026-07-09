@@ -651,7 +651,6 @@ std::vector<pm::EdgeReweight> pm::UserGraph::parse_reweight_specs(
         reweight.search_graph_node1_neighbor_idx = SIZE_MAX;
         reweight.search_graph_node2_neighbor_idx = SIZE_MAX;
         reweight.original_normalized_weight = 0;
-        reweight.new_normalized_weight = 0;
 
         validated.push_back(reweight);
     }
@@ -661,6 +660,14 @@ std::vector<pm::EdgeReweight> pm::UserGraph::parse_reweight_specs(
 
 void pm::UserGraph::apply_reweights(
     std::vector<EdgeReweight>&& parsed_reweights, bool needs_regeneration, bool ensure_search_graph) {
+    // Defensive: applying while a previous apply is still outstanding would
+    // silently discard its snapshots and bake its Tier-1 writes into the graph.
+    // Unreachable through the pybind callers, which pair every apply with a
+    // restore on both the success and exception paths.
+    if (!_active_reweights.empty()) {
+        throw std::logic_error("apply_reweights called with reweights already applied (missing restore_weights)");
+    }
+
     // Reject reweighting on graphs with any negative edge weight: the matching
     // graph stores abs(weight) in the slot plus baked-in compensation (virtual
     // detection events, pre-flipped observables, negative_weight_sum) that an
@@ -715,21 +722,14 @@ void pm::UserGraph::apply_reweights(
         // refresh (and without dropping a search graph a previous caller built).
         (void)(with_search_graph ? get_mwpm_with_search_graph() : get_mwpm());
     } else {
-        // Optimization 2: Skip UserGraph updates in Tier 1 mode
-        // Note: edges() will return original weights during reweighted decode
-        // This is documented behavior for performance optimization
+        // Tier 1: leave the UserGraph untouched; only the discretized slots in
+        // the existing matching/search graphs change (so edges() keeps returning
+        // the original weights, and no regeneration is scheduled).
 
-        // Locate every discretized-weight slot for each reweighted edge, snapshot
-        // the value it currently holds (so restore_weights can write it back
-        // verbatim rather than re-deriving it, which risked mismatching the
-        // build-time discretization), and discretize the new weight.
-        // NOTE: graph.normalising_constant already has the factor of 2 baked in
-        // (see iter_discretized_edges, which returns `normalising_constant * 2`).
-        // Build-time discretization is `round(weight * nc_base) * 2` where
-        // nc_base == graph.normalising_constant / 2, so we must divide by 2 inside
-        // the round() to match it. Multiplying by graph.normalising_constant and
-        // then by 2 would apply the factor of 2 twice, doubling every reweighted
-        // edge's integer weight.
+        // Locate every discretized-weight slot for each reweighted edge and
+        // snapshot the value it currently holds, so restore_weights can write it
+        // back verbatim rather than re-deriving it (which risked mismatching the
+        // build-time discretization).
         const auto& matching_graph = _mwpm.flooder.graph;
         const auto& search_graph = _mwpm.search_flooder.graph;
         for (auto& rw : _active_reweights) {
@@ -739,21 +739,29 @@ void pm::UserGraph::apply_reweights(
                 rw.matching_graph_node2_neighbor_idx = find_neighbor_index_in_graph(matching_graph, rw.node2, rw.node1);
                 rw.search_graph_node2_neighbor_idx = find_neighbor_index_in_graph(search_graph, rw.node2, rw.node1);
             }
+            // The matching and search graphs are built from the same UserGraph by
+            // the same helper, so a slot present in one is present in the other:
+            // one snapshot suffices. A SIZE_MAX index here means the edge has no
+            // slot in either graph (a self-loop, dropped at build time), making
+            // the reweight a no-op in both tiers.
             if (rw.matching_graph_node1_neighbor_idx != SIZE_MAX) {
                 rw.original_normalized_weight =
                     _mwpm.flooder.graph.nodes[rw.node1].neighbor_weights[rw.matching_graph_node1_neighbor_idx];
-            } else if (rw.search_graph_node1_neighbor_idx != SIZE_MAX) {
-                rw.original_normalized_weight =
-                    _mwpm.search_flooder.graph.nodes[rw.node1].neighbor_weights[rw.search_graph_node1_neighbor_idx];
             }
-            rw.new_normalized_weight =
-                (weight_int)round(rw.new_weight * mwpm.flooder.graph.normalising_constant / 2) * 2;
         }
 
         // Write the new weights only after every snapshot is taken, so duplicate
         // reweights of the same edge in one call snapshot the true original.
+        // NOTE: graph.normalising_constant already has the factor of 2 baked in
+        // (see iter_discretized_edges, which returns `normalising_constant * 2`).
+        // Build-time discretization is `round(weight * nc_base) * 2` where
+        // nc_base == graph.normalising_constant / 2, so we must divide by 2 inside
+        // the round() to match it. Multiplying by graph.normalising_constant and
+        // then by 2 would apply the factor of 2 twice, doubling every reweighted
+        // edge's integer weight.
+        double nc = mwpm.flooder.graph.normalising_constant;
         for (const auto& rw : _active_reweights) {
-            write_reweight_slots(rw, rw.new_normalized_weight);
+            write_reweight_slots(rw, (weight_int)round(rw.new_weight * nc / 2) * 2);
         }
 
         // DO NOT set _mwpm_needs_updating = true
@@ -776,9 +784,8 @@ void pm::UserGraph::restore_weights() {
         // UserGraph edge weights changed, so the cached edge stats are stale.
         invalidate_edge_stats();
     } else {
-        // Optimization 2: Skip UserGraph restoration in Tier 1 mode
-        // UserGraph was never modified, so no need to restore it.
-        // Write the snapshotted discretized weights back verbatim.
+        // Tier 1: the UserGraph was never modified, so only the discretized
+        // slots are restored -- the snapshots are written back verbatim.
         for (const auto& rw : _active_reweights) {
             write_reweight_slots(rw, rw.original_normalized_weight);
         }
