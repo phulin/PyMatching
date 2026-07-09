@@ -309,6 +309,12 @@ double pm::UserGraph::max_abs_weight_including_implied() {
     // The same maximum get_edge_weight_normalising_constant sizes the
     // discretization by: edges AND implied correlation weights. Kept separate
     // from max_abs_weight() (edge-only, cached, part of the public surface).
+    // Cached because needs_regeneration calls this on the per-decode hot path;
+    // an uncached O(E) list traversal per reweighted decode measurably slows
+    // Tier-1 (invalidated together with the edge-only cache).
+    if (_max_weight_incl_implied_cache_valid) {
+        return _cached_max_abs_weight_incl_implied;
+    }
     double max_weight = max_abs_weight();
     for (auto& e : edges) {
         for (const auto& implied : e.implied_weights_for_other_edges) {
@@ -316,11 +322,14 @@ double pm::UserGraph::max_abs_weight_including_implied() {
                 max_weight = std::abs(implied.implied_weight);
         }
     }
+    _cached_max_abs_weight_incl_implied = max_weight;
+    _max_weight_incl_implied_cache_valid = true;
     return max_weight;
 }
 
 void pm::UserGraph::invalidate_max_weight_cache() {
     _max_weight_cache_valid = false;
+    _max_weight_incl_implied_cache_valid = false;
 }
 
 pm::MatchingGraph pm::UserGraph::to_matching_graph(pm::weight_int num_distinct_weights) {
@@ -574,7 +583,14 @@ pm::UserGraph pm::detector_error_model_to_user_graph(
     return user_graph;
 }
 
-void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& reweight_specs, pm::Mwpm& mwpm, bool needs_regeneration) {
+void pm::UserGraph::apply_reweights(
+    const std::vector<std::array<double, 3>>& reweight_specs, bool needs_regeneration, bool ensure_search_graph) {
+    // Materialise the graph in the requested shape before touching anything, so
+    // any regeneration still pending (e.g. from a previous Tier-2 restore or a
+    // graph mutation) is applied and the Tier-1 snapshots below target the
+    // up-to-date graph. O(1) when nothing is pending.
+    pm::Mwpm& mwpm = ensure_search_graph ? get_mwpm_with_search_graph() : get_mwpm();
+
     // Reject reweighting on graphs with any negative edge weight: the matching
     // graph stores abs(weight) in the slot plus baked-in compensation (virtual
     // detection events, pre-flipped observables, negative_weight_sum) that an
@@ -671,10 +687,12 @@ void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& re
         validated.push_back(reweight);
     }
 
-    // Every spec validated; commit. From here on nothing throws before the
-    // apply completes (Tier-1 writes discretized ints; Tier-2 writes UserGraph
-    // floats for edges the validation loop just resolved).
+    // Every spec validated; commit, recording the tier so restore_weights can
+    // only ever undo with the tier that was applied. From here on nothing throws
+    // before the apply completes (Tier-1 writes discretized ints; Tier-2 writes
+    // UserGraph floats for edges the validation loop just resolved).
     _active_reweights = std::move(validated);
+    _active_reweights_regen = needs_regeneration;
 
     if (needs_regeneration) {
         // Full regeneration - need to update UserGraph edges
@@ -685,6 +703,9 @@ void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& re
         _mwpm_needs_updating = true;
         // UserGraph edge weights changed, so the cached max is no longer valid.
         invalidate_max_weight_cache();
+        // Materialise the regeneration now, in the same shape, so callers decode
+        // against the reweighted graph without needing a get_mwpm() refresh.
+        (void)(ensure_search_graph ? get_mwpm_with_search_graph() : get_mwpm());
     } else {
         // Optimization 2: Skip UserGraph updates in Tier 1 mode
         // Note: edges() will return original weights during reweighted decode
@@ -731,10 +752,11 @@ void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& re
     }
 }
 
-void pm::UserGraph::restore_weights(bool needs_regeneration) {
+void pm::UserGraph::restore_weights() {
     if (_active_reweights.empty()) return;
+    bool regen = _active_reweights_regen;
 
-    if (needs_regeneration) {
+    if (regen) {
         // Full regeneration path - need to restore UserGraph edges
         for (const auto& rw : _active_reweights) {
             size_t neighbor_idx = nodes[rw.node1].index_of_neighbor(rw.node2);
@@ -755,8 +777,21 @@ void pm::UserGraph::restore_weights(bool needs_regeneration) {
         // DO NOT set _mwpm_needs_updating = true
     }
 
-    // Reset state
+    // Reset state BEFORE materialising: the graph is fully restored at this
+    // point, so even if the rebuild below throws (e.g. bad_alloc), a repeated
+    // restore is a clean no-op rather than a replay.
     _active_reweights.clear();
+    _active_reweights_regen = false;
+
+    if (regen) {
+        // Materialise the regeneration back to the original graph, preserving
+        // the current shape (search graph present iff it is present now), so a
+        // following block or decode -- including one that applies no reweights
+        // -- sees the restored graph without needing a get_mwpm() refresh.
+        bool has_search_graph = _mwpm.flooder.graph.nodes.size() > 0 &&
+                                _mwpm.search_flooder.graph.nodes.size() == _mwpm.flooder.graph.nodes.size();
+        (void)(has_search_graph ? get_mwpm_with_search_graph() : get_mwpm());
+    }
 }
 
 bool pm::UserGraph::all_edges_integral() const {
@@ -884,4 +919,6 @@ void pm::UserGraph::populate_implied_edge_weights(
             }
         }
     }
+    // Implied weights feed max_abs_weight_including_implied's cache.
+    invalidate_max_weight_cache();
 }

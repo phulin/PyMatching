@@ -197,7 +197,6 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
            py::object edge_reweights = py::none()) {
             auto &mwpm = enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm();
             bool has_reweights = !edge_reweights.is_none();
-            bool needs_regeneration = false;
 
             // Parse the reweight specs (pure -- touches no graph state, safe
             // outside the try).
@@ -217,19 +216,17 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
 
             try {
                 // Apply reweights INSIDE the try, so a throw anywhere after graph
-                // state is first touched -- including a Tier-2 regeneration failing
-                // in the refresh below -- reaches the catch block's restore. This
-                // used to sit before the try: a throwing regeneration then left the
+                // state is first touched -- including a Tier-2 regeneration inside
+                // apply_reweights -- reaches the catch block's restore. This used
+                // to sit before the try: a throwing regeneration then left the
                 // UserGraph permanently holding the per-shot weights (matching
                 // decode_batch, which has always kept its apply inside its try).
+                // apply_reweights materialises the graph itself; `mwpm` references
+                // the persistent _mwpm member, rebuilt in place, so it needs no
+                // re-binding.
                 if (has_reweights) {
-                    needs_regeneration = self.needs_regeneration(reweight_specs);
-                    self.apply_reweights(reweight_specs, mwpm, needs_regeneration);
-                    // Called for its side effect only: materialise a Tier-2
-                    // regeneration before decoding. `mwpm` already references the
-                    // persistent _mwpm member, which is rebuilt in place, so it
-                    // needs no re-binding.
-                    (void)(enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm());
+                    self.apply_reweights(
+                        reweight_specs, self.needs_regeneration(reweight_specs), enable_correlations);
                 }
 
                 // Perform decoding
@@ -244,7 +241,7 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
 
                 // Restore original weights if reweights were applied
                 if (has_reweights) {
-                    self.restore_weights(needs_regeneration);
+                    self.restore_weights();
                 }
 
                 auto *obs_crossed_raw = obs_crossed.release();
@@ -257,9 +254,11 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                 return res;
 
             } catch (...) {
-                // Ensure weights are restored even on exception
+                // Ensure weights are restored even on exception. restore_weights
+                // undoes with the tier recorded at apply time, and is a no-op if
+                // apply itself threw before committing.
                 if (has_reweights) {
-                    self.restore_weights(needs_regeneration);
+                    self.restore_weights();
                 }
                 throw;
             }
@@ -375,12 +374,12 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
             if (reweight_stride < 1)
                 throw std::invalid_argument(
                     "reweight_stride must be a positive integer, got " + std::to_string(reweight_stride));
-            // Per-block regeneration decision. Each block's apply AND restore use the
-            // SAME flag, so a block that mutates the UserGraph (Tier 2) is always undone
-            // by a matching Tier-2 restore. `active_block_regen` tracks the in-flight
-            // block so an exception mid-block still restores with the correct tier.
+            // Per-block regeneration decision, precomputed below against the
+            // unmutated graph. apply_reweights records the tier it applied, and
+            // restore_weights undoes with that recorded tier, so a block that
+            // mutates the UserGraph (Tier 2) is always undone by a matching
+            // Tier-2 restore -- including on the exception path.
             std::vector<char> block_needs_regen;
-            bool active_block_regen = false;
             std::vector<std::vector<std::array<double, 3>>> all_reweight_specs;
 
             if (has_reweights) {
@@ -463,25 +462,16 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                     bool is_first_shot_in_block = (i % reweight_stride == 0);
                     bool is_last_shot_in_block = ((i + 1) % reweight_stride == 0) || (i == s.shape(0) - 1);
 
-                    // Apply reweights only at the start of each block
+                    // Apply reweights only at the start of each block.
+                    // apply_reweights materialises the graph itself (both any
+                    // regeneration pending from a previous block's Tier-2 restore
+                    // and this block's own Tier-2 apply), so no get_mwpm() refresh
+                    // is needed here or per shot. `mwpm` is a reference to the
+                    // persistent _mwpm member, so it reflects rebuilt graphs.
                     if (has_reweights && is_first_shot_in_block && !all_reweight_specs[rule_idx].empty()) {
-                        // Materialise any pending regeneration (from a previous block's
-                        // Tier-2 restore) before touching the graph, so a Tier-1 apply
-                        // operates on an up-to-date matching graph.
-                        (void)(enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm());
-                        active_block_regen = block_needs_regen[rule_idx];
-                        self.apply_reweights(all_reweight_specs[rule_idx], mwpm, active_block_regen);
+                        self.apply_reweights(
+                            all_reweight_specs[rule_idx], block_needs_regen[rule_idx], enable_correlations);
                     }
-
-                    // Re-fetch the mwpm before decoding so any pending regeneration takes
-                    // effect: this block's Tier-2 apply, or a previous block's Tier-2
-                    // restore ahead of a block that carries no reweights. `mwpm` is a
-                    // reference to the persistent _mwpm member, so it reflects the rebuilt
-                    // graph. A regeneration can only become pending at a block boundary
-                    // (apply above, or the previous block's restore), so only the first
-                    // shot of a block needs the refresh.
-                    if (has_reweights && is_first_shot_in_block)
-                        (void)(enable_correlations ? self.get_mwpm_with_search_graph() : self.get_mwpm());
 
                     // Extract detection events for this shot
                     if (bit_packed_shots) {
@@ -544,11 +534,13 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                     }
                     detection_events.clear();
 
-                    // Restore weights only at the end of each block. Restore uses the
-                    // SAME regeneration flag as this block's apply, so a Tier-2 apply
-                    // (which mutated the UserGraph) is always undone by a Tier-2 restore.
+                    // Restore weights only at the end of each block. restore_weights
+                    // undoes with the tier recorded at apply time, so a Tier-2 apply
+                    // (which mutated the UserGraph) is always undone by a Tier-2
+                    // restore, and it re-materialises the graph so the next block --
+                    // including one with no reweights -- sees the restored graph.
                     if (has_reweights && is_last_shot_in_block && !all_reweight_specs[rule_idx].empty()) {
-                        self.restore_weights(block_needs_regen[rule_idx]);
+                        self.restore_weights();
                     }
                 }
 
@@ -556,10 +548,11 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                 return py::make_tuple(predictions, weights, no_matching);
 
             } catch (...) {
-                // Ensure weights are restored even on exception, using the in-flight
-                // block's regeneration flag so the UserGraph is undone if it was mutated.
+                // Ensure weights are restored even on exception: restore_weights
+                // undoes the in-flight block with the tier recorded at apply time
+                // (no-op if no apply is outstanding).
                 if (has_reweights) {
-                    self.restore_weights(active_block_regen);
+                    self.restore_weights();
                 }
                 throw;
             }

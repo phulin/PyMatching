@@ -153,9 +153,19 @@ class UserGraph {
     void populate_implied_edge_weights(
         std::map<std::pair<size_t, size_t>, std::map<std::pair<size_t, size_t>, double>>& joint_probabilites);
 
-    // Edge reweighting methods
-    void apply_reweights(const std::vector<std::array<double, 3>>& reweight_specs, pm::Mwpm& mwpm, bool needs_regeneration = false);
-    void restore_weights(bool needs_regeneration = false);
+    // Edge reweighting methods.
+    /// Apply per-shot reweights. `needs_regeneration` selects the tier (the caller
+    /// decides it -- decode_batch must precompute per-block tiers against the
+    /// unmutated graph); `ensure_search_graph` selects the graph shape to
+    /// materialise (pass enable_correlations). Materialises the graph itself:
+    /// callers need no get_mwpm() refresh before or after.
+    void apply_reweights(
+        const std::vector<std::array<double, 3>>& reweight_specs,
+        bool needs_regeneration,
+        bool ensure_search_graph);
+    /// Undo the last apply_reweights, using the tier recorded at apply time (a
+    /// mismatched tier pair is unrepresentable). No-op if nothing is applied.
+    void restore_weights();
     bool needs_regeneration(const std::vector<std::array<double, 3>>& reweight_specs);
 
     /// Invalidate the max weight cache (call when edges are modified)
@@ -169,10 +179,14 @@ class UserGraph {
 
     // Reweighting state
     std::vector<EdgeReweight> _active_reweights;
+    /// Tier recorded by apply_reweights; restore_weights undoes with the same tier.
+    bool _active_reweights_regen = false;
 
     // Optimization 5: Lazy max weight caching
     double _cached_max_abs_weight;
     bool _max_weight_cache_valid;
+    double _cached_max_abs_weight_incl_implied = 0;
+    bool _max_weight_incl_implied_cache_valid = false;
 
     // Internal reweighting helper methods
     /// Write `value` into every discretized-weight slot referenced by `rw` (both
