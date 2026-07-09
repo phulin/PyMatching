@@ -121,6 +121,9 @@ class UserGraph {
     void add_noise(uint8_t* error_arr, uint8_t* syndrome_arr) const;
     bool all_edges_have_error_probabilities();
     double max_abs_weight();
+    /// Max over edge weights AND implied correlation weights -- the maximum that
+    /// get_edge_weight_normalising_constant sizes the discretization by.
+    double max_abs_weight_including_implied();
     double get_edge_weight_normalising_constant(size_t max_num_distinct_weights);
     /// Returns true iff every edge weight (and implied weight) is an integer. In that
     /// case get_edge_weight_normalising_constant collapses to 1.0, giving integer-only

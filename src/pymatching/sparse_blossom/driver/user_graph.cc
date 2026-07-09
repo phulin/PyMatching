@@ -26,9 +26,11 @@ double bernoulli_xor(double p1, double p2) {
 /// Returns the index of `node2` in `node1`'s neighbor list within `graph` (a
 /// matching or search graph; `node2 == SIZE_MAX` finds the boundary slot), or
 /// SIZE_MAX if the graph or slot is absent. Absence is not an error here,
-/// unlike the nodes' own index_of_neighbor: a reweighted UserGraph edge can be
-/// missing from the discretized graph (e.g. an edge between two boundary
-/// nodes), in which case there is simply no slot to update.
+/// unlike the nodes' own index_of_neighbor. NOTE: only edges with a dedicated
+/// slot are addressable this way -- edges incident to a boundary NODE are
+/// stored as a nullptr boundary slot at the other endpoint (or dropped
+/// entirely), so needs_regeneration routes reweights of such edges through a
+/// full regeneration instead of this lookup.
 template <typename Graph>
 size_t find_neighbor_index_in_graph(const Graph& graph, size_t node1, size_t node2) {
     if (node1 >= graph.nodes.size() || (node2 != SIZE_MAX && node2 >= graph.nodes.size()))
@@ -303,6 +305,20 @@ double pm::UserGraph::max_abs_weight() {
     return max_weight;
 }
 
+double pm::UserGraph::max_abs_weight_including_implied() {
+    // The same maximum get_edge_weight_normalising_constant sizes the
+    // discretization by: edges AND implied correlation weights. Kept separate
+    // from max_abs_weight() (edge-only, cached, part of the public surface).
+    double max_weight = max_abs_weight();
+    for (auto& e : edges) {
+        for (const auto& implied : e.implied_weights_for_other_edges) {
+            if (std::abs(implied.implied_weight) > max_weight)
+                max_weight = std::abs(implied.implied_weight);
+        }
+    }
+    return max_weight;
+}
+
 void pm::UserGraph::invalidate_max_weight_cache() {
     _max_weight_cache_valid = false;
 }
@@ -559,8 +575,16 @@ pm::UserGraph pm::detector_error_model_to_user_graph(
 }
 
 void pm::UserGraph::apply_reweights(const std::vector<std::array<double, 3>>& reweight_specs, pm::Mwpm& mwpm, bool needs_regeneration) {
-    // Check graph has no negative weights
-    if (!mwpm.flooder.negative_weight_detection_events.empty()) {
+    // Reject reweighting on graphs with any negative edge weight: the matching
+    // graph stores abs(weight) in the slot plus baked-in compensation (virtual
+    // detection events, pre-flipped observables, negative_weight_sum) that an
+    // in-place Tier-1 write cannot maintain. negative_weight_sum is the reliable
+    // signal -- every negative edge contributes a strictly negative term, so it
+    // cannot cancel. The detection-events set previously checked here is
+    // parity-toggled per endpoint and cancels to empty on cycles of negative
+    // edges (e.g. a negative triangle), which slipped past the guard and made
+    // Tier-1 reweights of those edges decode silently wrong.
+    if (mwpm.flooder.graph.negative_weight_sum != 0) {
         throw std::invalid_argument("Edge reweighting not supported with negative edge weights");
     }
 
@@ -748,7 +772,12 @@ bool pm::UserGraph::all_edges_integral() const {
 }
 
 bool pm::UserGraph::needs_regeneration(const std::vector<std::array<double, 3>>& reweight_specs) {
-    double original_max_abs_weight = max_abs_weight();
+    // Compare against the SAME maximum the normalising constant is sized by:
+    // get_edge_weight_normalising_constant takes the max over edges AND implied
+    // correlation weights. Using the edge-only max would needlessly classify
+    // reweights in (edge_max, implied_max] as Tier-2 (two full rebuilds per
+    // decode) even though an in-place write at the actual constant is exact.
+    double original_max_abs_weight = max_abs_weight_including_implied();
     double max_new_abs_weight = original_max_abs_weight;
 
     // When the current graph is all-integral, get_edge_weight_normalising_constant
@@ -759,13 +788,53 @@ bool pm::UserGraph::needs_regeneration(const std::vector<std::array<double, 3>>&
     // all_integral_weight false, rescaling the constant to fine resolution.
     bool graph_all_integral = all_edges_integral();
 
-    // Find the maximum reweight magnitude (regeneration is also required when a
-    // reweight exceeds the original max, which changes the normalising constant).
+    // Returns true iff node u has an edge to a boundary NODE (as opposed to the
+    // virtual boundary): such edges min-merge with u's explicit boundary edge
+    // into a single discretized boundary slot at build time.
+    auto has_boundary_node_neighbor = [&](size_t u) {
+        for (const auto& neighbor : nodes[u].neighbors) {
+            size_t other = neighbor.pos == 0 ? neighbor.edge_it->node1 : neighbor.edge_it->node2;
+            if (other != SIZE_MAX && nodes[other].is_boundary)
+                return true;
+        }
+        return false;
+    };
+
     for (const auto& spec : reweight_specs) {
         double new_weight = spec[2];
         if (graph_all_integral && round(new_weight) != new_weight)
             return true;
+        // Regeneration is also required when a reweight exceeds the original max,
+        // which changes the normalising constant.
         max_new_abs_weight = std::max(max_new_abs_weight, std::abs(new_weight));
+
+        // Slot-ambiguity rules: force regeneration when the spec touches an edge
+        // with no dedicated in-place slot, where a Tier-1 write would silently
+        // no-op or corrupt shared state. Regeneration re-derives the discretized
+        // graph from the UserGraph (including boundary min-merging), so it
+        // handles all of these exactly. Node values are interpreted only when
+        // castable; malformed specs are left for apply_reweights to reject.
+        double n1_raw = spec[0], n2_raw = spec[1];
+        bool n1_castable =
+            std::isfinite(n1_raw) && n1_raw >= 0 && round(n1_raw) == n1_raw && n1_raw < (double)nodes.size();
+        if (!n1_castable)
+            continue;
+        size_t node1 = (size_t)n1_raw;
+        if (n2_raw == -1.0) {
+            // Explicit boundary edge (u,-1): its discretized slot is shared with
+            // any edge (u,v) where v is a boundary node (min-merged), and it has
+            // no slot at all if u is itself a boundary node.
+            if (nodes[node1].is_boundary || has_boundary_node_neighbor(node1))
+                return true;
+        } else if (
+            std::isfinite(n2_raw) && n2_raw >= 0 && round(n2_raw) == n2_raw && n2_raw < (double)nodes.size()) {
+            // Edge (u,v): if either endpoint is a boundary node, the edge is
+            // stored as a nullptr boundary slot at the other endpoint (or not at
+            // all), which the Tier-1 pointer lookup cannot address.
+            size_t node2 = (size_t)n2_raw;
+            if (nodes[node1].is_boundary || nodes[node2].is_boundary)
+                return true;
+        }
     }
 
     return max_new_abs_weight > original_max_abs_weight;
