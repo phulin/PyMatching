@@ -196,8 +196,11 @@ class TestEdgeReweighting:
         assert np.isclose(weight_rw, 0.5)  # exact reweighted value, not just "different"
 
     def test_correlations_with_reweights(self):
-        """enable_correlations reweights the search graph too; the result must match a
-        freshly-built matcher with the reweighted edge (same normalisation via a pinned max)."""
+        """Correlations decode with a reweight matches a freshly-built matcher.
+
+        NOTE: this graph is all-integral, so the fractional 0.5 reweight takes the
+        REGENERATION (Tier-2) path. The in-place Tier-1 search-graph path is
+        covered by TestTier1Coverage::test_tier1_correlations_matches_oracle."""
         def build(w01):
             m = Matching()
             m.add_edge(0, 1, weight=w01, fault_ids=0)
@@ -1074,6 +1077,109 @@ class TestImpliedWeightAwareTier:
                                        enable_correlations=True)
         np.testing.assert_array_equal(pred_after, pred_p)
         assert np.isclose(w_after, w_p)
+
+
+class TestTier1Coverage:
+    """Tier-1 (in-place, no regeneration) paths that the rest of the suite only
+    exercised via Tier-2: several older tests use all-integral graphs, whose
+    fractional reweights secretly trip the integral-graph rule and regenerate.
+    All graphs here have non-integral base weights so in-range reweights stay
+    genuinely in-place.
+    """
+
+    @staticmethod
+    def build(w01=1.3):
+        m = Matching()
+        m.add_edge(0, 1, weight=w01, fault_ids=0)
+        m.add_edge(1, 2, weight=1.1, fault_ids=1)
+        m.add_boundary_edge(0, weight=2.7, fault_ids=2)  # pins max at 2.7
+        m.add_boundary_edge(2, weight=2.7, fault_ids=3)
+        return m
+
+    def test_tier1_correlations_matches_oracle(self):
+        # The only in-suite exercise of write_reweight_slots' search-graph half
+        # and the Tier-1 snapshot with a search graph present.
+        syndrome = np.array([1, 0, 1])
+        m = self.build()
+        corr, w = m.decode(
+            syndrome,
+            edge_reweights=np.array([[0, 1, 0.5]], dtype=np.float64),  # 0.5 < max 2.7 -> Tier-1
+            enable_correlations=True,
+            return_weight=True,
+        )
+        corr_o, w_o = self.build(0.5).decode(syndrome, enable_correlations=True, return_weight=True)
+        np.testing.assert_array_equal(corr, corr_o)
+        assert np.isclose(w, w_o)
+
+        # Restore: plain correlations decode matches a pristine matcher.
+        corr_p, w_p = self.build().decode(syndrome, enable_correlations=True, return_weight=True)
+        corr_after, w_after = m.decode(syndrome, enable_correlations=True, return_weight=True)
+        np.testing.assert_array_equal(corr_after, corr_p)
+        assert np.isclose(w_after, w_p)
+
+    def test_tier1_exception_restore(self):
+        # Both pre-existing exception-safety tests use all-integral graphs, so
+        # only the Tier-2 restore (UserGraph rewrite + regeneration) ever ran on
+        # the throw path; the Tier-1 snapshot write-back after an exception was
+        # untested.
+        def build():
+            m = Matching()
+            m.add_edge(0, 1, weight=1.5, fault_ids=0)  # no boundary -> [1,0,0] unmatchable
+            m.add_edge(1, 2, weight=1.5, fault_ids=1)
+            return m
+
+        m = build()
+        with pytest.raises(ValueError):
+            # 0.5 < max 1.5 on a non-integral graph -> Tier-1 apply, then the
+            # unmatchable syndrome raises inside the decode.
+            m.decode(np.array([1, 0, 0]), edge_reweights=np.array([[0, 1, 0.5]], dtype=np.float64))
+
+        syndrome = np.array([1, 1, 0])
+        corr, w = m.decode(syndrome, return_weight=True)
+        corr_fresh, w_fresh = build().decode(syndrome, return_weight=True)
+        np.testing.assert_array_equal(corr, corr_fresh)
+        assert np.isclose(w, w_fresh)
+
+    def test_duplicate_edge_specs_last_wins_and_restores(self):
+        # The only test protecting apply's snapshot-before-write ordering: with
+        # duplicate specs for one edge, the second entry must snapshot the TRUE
+        # original (not the first entry's value), or restore leaves the first
+        # reweight permanently applied.
+        syndrome = np.array([1, 1, 0])
+        m = self.build()
+        _, w = m.decode(
+            syndrome,
+            edge_reweights=np.array([[0, 1, 0.9], [0, 1, 0.4]], dtype=np.float64),
+            return_weight=True,
+        )
+        _, w_last = self.build(0.4).decode(syndrome, return_weight=True)
+        assert np.isclose(w, w_last)  # last spec wins
+
+        # Restore: back to the build value, not 0.9.
+        _, w_after = m.decode(syndrome, return_weight=True)
+        _, w_pristine = self.build().decode(syndrome, return_weight=True)
+        assert np.isclose(w_after, w_pristine)
+
+    def test_multi_shot_tier1_block_values(self):
+        # Shots 2..k of a Tier-1 block must decode against the in-place
+        # reweighted weights, and a following block must see the restored graph.
+        # The only pre-existing multi-shot Tier-1 block test asserted shapes
+        # only, with zero observables.
+        syndrome = np.array([1, 1, 0], dtype=np.uint8)
+        shots = np.tile(syndrome, (4, 1))
+        m = self.build()
+        _, ws = m.decode_batch(
+            shots,
+            edge_reweights=[np.array([[0, 1, 0.4]], dtype=np.float64), None],
+            reweight_stride=2,
+            return_weights=True,
+        )
+        _, w_rw = self.build(0.4).decode(syndrome, return_weight=True)
+        _, w_plain = self.build().decode(syndrome, return_weight=True)
+        assert not np.isclose(w_rw, w_plain)  # the reweight is discriminating
+        # Both shots of the reweighted block see 0.4; both shots of the None
+        # block see the restored original.
+        assert np.allclose(ws, [w_rw, w_rw, w_plain, w_plain])
 
 
 if __name__ == "__main__":
