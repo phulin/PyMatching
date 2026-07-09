@@ -212,6 +212,11 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
                         reweights_unchecked(i, 2)
                     });
                 }
+                // A zero-row array is a no-op, exactly like edge_reweights=None
+                // and like decode_batch's treatment of empty/None rules --
+                // without this, the apply/restore transaction would run (and
+                // e.g. reject the no-op on negative-weight graphs).
+                has_reweights = !reweight_specs.empty();
             }
 
             try {

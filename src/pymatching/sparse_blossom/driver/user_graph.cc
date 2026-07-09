@@ -602,15 +602,18 @@ void pm::UserGraph::apply_reweights(
     // Validate and prepare reweights
     for (const auto& spec : reweight_specs) {
         // Node indices arrive as user-supplied doubles; ensure the value is safely
-        // castable BEFORE any cast. Casting a negative, non-finite, non-integral, or
-        // >= 2^64 double to size_t is undefined behaviour and silently "succeeds"
-        // with garbage on most platforms (e.g. on arm64 NaN converts to node 0,
-        // 1e30 saturates to SIZE_MAX -- the boundary sentinel -- and 2.7 truncates
-        // to node 2), reweighting the wrong edge with no error. In-range but
-        // nonexistent nodes fall through to the "Edge does not exist" check below,
-        // preserving the pre-existing error for that case.
+        // castable BEFORE any cast. Casting a negative, non-finite, non-integral,
+        // or too-large double to size_t is undefined behaviour and silently
+        // "succeeds" with garbage on most platforms (e.g. on arm64 NaN converts to
+        // node 0, 1e30 saturates to SIZE_MAX -- the boundary sentinel -- and 2.7
+        // truncates to node 2), reweighting the wrong edge with no error. The
+        // bound is derived from the platform: (double)SIZE_MAX rounds UP to 2^64
+        // on 64-bit size_t (the exact boundary for defined casts) and is exactly
+        // representable on 32-bit, where it also rejects the SIZE_MAX boundary
+        // sentinel itself. In-range but nonexistent nodes fall through to the
+        // "Edge does not exist" check below, preserving the pre-existing error.
         auto validate_node_index = [](double v, const char* which) {
-            if (!std::isfinite(v) || v < 0 || round(v) != v || v >= 18446744073709551616.0 /* 2^64 */)
+            if (!std::isfinite(v) || v < 0 || round(v) != v || v >= (double)SIZE_MAX)
                 throw std::invalid_argument(
                     std::string("Reweight ") + which + " must be a finite non-negative integer, got " +
                     std::to_string(v));
@@ -620,13 +623,13 @@ void pm::UserGraph::apply_reweights(
         double node2_raw = spec[1];
         size_t node2;
 
-        // Validate boundary edge format first. (NaN < 0 is false, so non-finite
-        // values fall through to validate_node_index below.)
-        if (node2_raw < 0) {
-            if (node2_raw != -1.0) {
-                throw std::invalid_argument("Boundary edges must use exactly -1 as second node");
-            }
+        // Exactly -1 is the boundary sentinel; other FINITE negatives get the
+        // boundary-format error; everything else (including NaN and +/-inf) goes
+        // through validate_node_index for the castability diagnostic.
+        if (node2_raw == -1.0) {
             node2 = SIZE_MAX;
+        } else if (std::isfinite(node2_raw) && node2_raw < 0) {
+            throw std::invalid_argument("Boundary edges must use exactly -1 as second node");
         } else {
             validate_node_index(node2_raw, "node2");
             node2 = (size_t)node2_raw;

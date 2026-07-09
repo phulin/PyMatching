@@ -854,15 +854,32 @@ class TestReweightInputValidation:
             m.decode(self.SYNDROME, edge_reweights=np.array([[0, 1, 2.0**25]]))
         self.assert_unchanged(m)
 
-    @pytest.mark.parametrize("bad_node", [float("nan"), float("inf"), 1e30, 2.7])
+    @pytest.mark.parametrize("bad_node", [float("nan"), float("inf"), float("-inf"), 1e30, 2.7])
     @pytest.mark.parametrize("position", [0, 1])
     def test_bad_node_index_raises(self, bad_node, position):
         m = self.build()
         spec = [0.0, 1.0, 0.5]
         spec[position] = bad_node
-        with pytest.raises(ValueError, match="non-negative integer|exactly -1"):
+        # Non-finite and non-castable values get the castability diagnostic;
+        # only finite negatives other than -1 get the boundary-format error.
+        with pytest.raises(ValueError, match="non-negative integer"):
             m.decode(self.SYNDROME, edge_reweights=np.array([spec]))
         self.assert_unchanged(m)
+
+    def test_empty_reweights_array_is_noop(self):
+        # A zero-row array must behave exactly like edge_reweights=None (and
+        # like decode_batch's empty/None rules): no transaction, no guard.
+        # Regression: this used to raise on negative-weight graphs.
+        m = Matching()
+        m.add_edge(0, 1, weight=-1, fault_ids=0)
+        m.add_edge(1, 2, weight=-1, fault_ids=1)
+        m.add_edge(0, 2, weight=-1, fault_ids=2)
+        m.add_boundary_edge(0, weight=2, fault_ids=3)
+        pred_none, w_none = m.decode(np.array([0, 0, 0]), return_weight=True)
+        pred_empty, w_empty = m.decode(np.array([0, 0, 0]),
+                                       edge_reweights=np.zeros((0, 3)), return_weight=True)
+        np.testing.assert_array_equal(pred_empty, pred_none)
+        assert w_empty == w_none
 
     def test_node_index_out_of_range_raises(self):
         # In-range-castable but nonexistent nodes keep the pre-existing error.
@@ -931,7 +948,10 @@ class TestReweightInputValidation:
         m = self.build()
         shots = np.zeros((8, 3), dtype=np.uint8)
         rules = [np.array([[0, 1, 0.5]]), np.array([[1, 2, 0.9]])]
-        with pytest.raises(ValueError, match="must be equal"):
+        # 64-bit size_t: the C++ division-based check raises ValueError; on a
+        # 32-bit size_t build pybind rejects the argument at conversion instead.
+        with pytest.raises((ValueError, TypeError),
+                           match="must be equal|incompatible function arguments"):
             m.decode_batch(shots, edge_reweights=rules, reweight_stride=2**63 + 4)
         self.assert_unchanged(m)
 
