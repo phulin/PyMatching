@@ -16,7 +16,6 @@ import numpy as np
 import pytest
 from scipy.sparse import csc_matrix
 
-import pymatching
 from pymatching import Matching
 
 
@@ -33,7 +32,7 @@ class TestEdgeReweighting:
 
         # Test without reweighting
         syndrome = np.array([1, 0, 1])
-        correction_orig = m.decode(syndrome)
+        m.decode(syndrome)
 
         # Test with edge reweighting - make edge (0,1) much heavier
         edge_reweights = np.array([
@@ -167,7 +166,7 @@ class TestEdgeReweighting:
 
         # Decode with reweights
         edge_reweights = np.array([[0, 1, 10.0]], dtype=np.float64)
-        correction_reweighted = m.decode(syndrome, edge_reweights=edge_reweights)
+        m.decode(syndrome, edge_reweights=edge_reweights)
 
         # Decode again without reweights - should match original
         correction_restored = m.decode(syndrome)
