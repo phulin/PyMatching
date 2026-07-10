@@ -537,7 +537,8 @@ class Matching:
     def decode_to_edges_array(self,
                               syndrome: Union[np.ndarray, List[bool], List[int]],
                               *,
-                              enable_correlations: bool = False
+                              enable_correlations: bool = False,
+                              edge_reweights: np.ndarray = None
                               ) -> np.ndarray:
         """
         Decode the syndrome `syndrome` using minimum-weight perfect matching, returning the edges in the
@@ -564,6 +565,16 @@ class Matching:
             `stim.DetectorErrorModel` with `enable_correlations=True`. For a description
             of the correlated matching algorithm, see https://arxiv.org/abs/1310.0863.
             By default, False
+        edge_reweights : numpy.ndarray, optional
+            A 2D array of shape `(num_reweights, 3)` where each row `[node1, node2, weight]`
+            temporarily overrides the weight of edge `(node1, node2)` for this decode call
+            only; original weights are restored before the method returns, and
+            `Matching.edges()` always reflects the original weights. Use exactly `-1` for
+            `node2` to reweight the boundary edge of `node1`. Weights must be finite,
+            non-negative and at most 2**24 - 1 = 16777215; node indices must be
+            non-negative integers naming an existing edge. Invalid rows raise `ValueError`,
+            as does reweighting any graph that contains negative edge weights. A zero-row
+            array is equivalent to `None`. By default, None.
 
         Returns
         -------
@@ -595,7 +606,7 @@ class Matching:
         """
         detection_events = self._syndrome_array_to_detection_events(syndrome)
         return self._matching_graph.decode_to_edges_array(
-            detection_events, enable_correlations=enable_correlations
+            detection_events, enable_correlations=enable_correlations, edge_reweights=edge_reweights
         )
 
     def decode_to_matched_dets_array(self,

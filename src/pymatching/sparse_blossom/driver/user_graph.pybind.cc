@@ -274,24 +274,75 @@ void pm_pybind::pybind_user_graph_methods(py::module &m, py::class_<pm::UserGrap
         "edge_reweights"_a = py::none());
     g.def(
         "decode_to_edges_array",
-        [](pm::UserGraph &self, const py::array_t<uint64_t> &detection_events, bool enable_correlations) {
+        [](pm::UserGraph &self,
+           const py::array_t<uint64_t> &detection_events,
+           bool enable_correlations,
+           py::object edge_reweights = py::none()) {
             auto &mwpm = self.get_mwpm_with_search_graph();
-            std::vector<uint64_t> detection_events_vec(
-                detection_events.data(), detection_events.data() + detection_events.size());
-            auto edges = new std::vector<int64_t>();
-            edges->reserve(detection_events_vec.size() / 2);
-            if (enable_correlations) {
-                pm::decode_detection_events_to_edges_with_edge_correlations(mwpm, detection_events_vec, *edges);
-            } else {
-                pm::decode_detection_events_to_edges(mwpm, detection_events_vec, *edges);
+            bool has_reweights = !edge_reweights.is_none();
+
+            // Parse the reweight specs (pure -- touches no graph state, safe
+            // outside the try).
+            std::vector<std::array<double, 3>> reweight_specs;
+            if (has_reweights) {
+                py::array_t<double> reweights_array = edge_reweights.cast<py::array_t<double>>();
+                validate_reweights_array(reweights_array);
+                auto reweights_unchecked = reweights_array.unchecked<2>();
+                for (py::ssize_t i = 0; i < reweights_unchecked.shape(0); i++) {
+                    reweight_specs.push_back({
+                        reweights_unchecked(i, 0),
+                        reweights_unchecked(i, 1),
+                        reweights_unchecked(i, 2)
+                    });
+                }
+                // A zero-row array is a no-op, exactly like edge_reweights=None.
+                has_reweights = !reweight_specs.empty();
             }
-            auto num_edges = edges->size() / 2;
-            auto edges_arr = pm_pybind::vec_to_array<int64_t>(edges);
-            edges_arr.resize({(py::ssize_t)num_edges, (py::ssize_t)2});
-            return edges_arr;
+
+            try {
+                // Apply INSIDE the try so a throwing Tier-2 regeneration reaches the
+                // catch's restore. apply_reweights materialises the graph itself;
+                // this endpoint always decodes with the search graph, so ensure it.
+                // `mwpm` references the persistent _mwpm member, rebuilt in place,
+                // so it needs no re-binding.
+                if (has_reweights) {
+                    auto parsed = self.parse_reweight_specs(reweight_specs);
+                    bool regen = self.needs_regeneration(parsed);
+                    self.apply_reweights(std::move(parsed), regen, /*ensure_search_graph=*/true);
+                }
+
+                std::vector<uint64_t> detection_events_vec(
+                    detection_events.data(), detection_events.data() + detection_events.size());
+                // Owned by a unique_ptr so an exception below frees it rather than
+                // leaking; ownership passes to vec_to_array's capsule on success.
+                auto edges = std::make_unique<std::vector<int64_t>>();
+                edges->reserve(detection_events_vec.size() / 2);
+                if (enable_correlations) {
+                    pm::decode_detection_events_to_edges_with_edge_correlations(mwpm, detection_events_vec, *edges);
+                } else {
+                    pm::decode_detection_events_to_edges(mwpm, detection_events_vec, *edges);
+                }
+
+                if (has_reweights) {
+                    self.restore_weights();
+                }
+
+                auto num_edges = edges->size() / 2;
+                auto edges_arr = pm_pybind::vec_to_array<int64_t>(edges.release());
+                edges_arr.resize({(py::ssize_t)num_edges, (py::ssize_t)2});
+                return edges_arr;
+            } catch (...) {
+                // restore_weights undoes with the tier recorded at apply time and
+                // no-ops if apply itself threw before committing.
+                if (has_reweights) {
+                    self.restore_weights();
+                }
+                throw;
+            }
         },
         "detection_events"_a,
-        "enable_correlations"_a = false);
+        "enable_correlations"_a = false,
+        "edge_reweights"_a = py::none());
     g.def(
         "decode_to_matched_detection_events_array",
         [](pm::UserGraph &self, const py::array_t<uint64_t> &detection_events) {

@@ -1289,5 +1289,93 @@ class TestTier1Coverage:
         assert np.allclose(ws, [w_rw, w_rw, w_plain, w_plain])
 
 
+class TestDecodeToEdgesArrayReweights:
+    """Per-shot edge_reweights support for decode_to_edges_array.
+
+    Supersedes PR #1 (magzpavz), reimplemented on the hardened reweighting
+    machinery: parse/validate once, tier recorded at apply time, apply inside
+    the try, restore on both paths. Oracle-checked against freshly built
+    matchers rather than assert-not-None.
+    """
+
+    @staticmethod
+    def build(w01=1.3):
+        m = Matching()
+        m.add_edge(0, 1, weight=w01, fault_ids=0)
+        m.add_edge(1, 2, weight=1.1, fault_ids=1)
+        m.add_boundary_edge(0, weight=2.7, fault_ids=2)  # pins max at 2.7
+        m.add_boundary_edge(2, weight=2.7, fault_ids=3)
+        return m
+
+    @staticmethod
+    def sorted_edges(arr):
+        return arr[np.lexsort((arr[:, 1], arr[:, 0]))]
+
+    # Tier-1 (0.5 < max 2.7, non-integral graph) and Tier-2 (5.0 > max).
+    @pytest.mark.parametrize("new_w", [0.5, 5.0])
+    @pytest.mark.parametrize("enable_correlations", [False, True])
+    def test_reweighted_edges_match_oracle(self, new_w, enable_correlations):
+        syndrome = np.array([1, 1, 0])
+        m = self.build()
+        edges = m.decode_to_edges_array(
+            syndrome, edge_reweights=np.array([[0, 1, new_w]]),
+            enable_correlations=enable_correlations)
+        edges_o = self.build(new_w).decode_to_edges_array(
+            syndrome, enable_correlations=enable_correlations)
+        np.testing.assert_array_equal(self.sorted_edges(edges), self.sorted_edges(edges_o))
+
+        # The reweight must actually take effect: 0.5 keeps the direct (0,1)
+        # edge, 5.0 reroutes both detectors to the boundary.
+        edges_plain = self.build().decode_to_edges_array(
+            syndrome, enable_correlations=enable_correlations)
+        if new_w == 5.0:
+            assert not np.array_equal(self.sorted_edges(edges), self.sorted_edges(edges_plain))
+
+        # Restore: a plain call afterwards matches a pristine matcher.
+        edges_after = m.decode_to_edges_array(syndrome, enable_correlations=enable_correlations)
+        np.testing.assert_array_equal(self.sorted_edges(edges_after), self.sorted_edges(edges_plain))
+
+        # And the interleaved decode() weight is also restored, exactly.
+        _, w_after = m.decode(syndrome, return_weight=True)
+        _, w_pristine = self.build().decode(syndrome, return_weight=True)
+        assert w_after == w_pristine
+
+    def test_empty_reweights_array_is_noop(self):
+        m = self.build()
+        syndrome = np.array([1, 1, 0])
+        edges_none = m.decode_to_edges_array(syndrome)
+        edges_empty = m.decode_to_edges_array(syndrome, edge_reweights=np.zeros((0, 3)))
+        np.testing.assert_array_equal(self.sorted_edges(edges_none), self.sorted_edges(edges_empty))
+
+    def test_validation_and_restore_on_error(self):
+        m = self.build()
+        syndrome = np.array([1, 1, 0])
+        for bad in ([[0, 1, float("nan")]], [[0, 999, 0.5]], np.zeros((1, 2))):
+            with pytest.raises(ValueError):
+                m.decode_to_edges_array(syndrome, edge_reweights=np.array(bad))
+        # Matcher untouched after the rejected calls.
+        _, w = m.decode(syndrome, return_weight=True)
+        _, w_pristine = self.build().decode(syndrome, return_weight=True)
+        assert w == w_pristine
+
+    def test_exception_after_apply_restores(self):
+        # Boundaryless graph: odd-parity syndrome throws inside the decode,
+        # after the Tier-1 apply; the catch path must restore.
+        def build():
+            m = Matching()
+            m.add_edge(0, 1, weight=1.5, fault_ids=0)
+            m.add_edge(1, 2, weight=1.5, fault_ids=1)
+            return m
+
+        m = build()
+        with pytest.raises(ValueError):
+            m.decode_to_edges_array(np.array([1, 0, 0]),
+                                    edge_reweights=np.array([[0, 1, 0.5]]))
+        syndrome = np.array([1, 1, 0])
+        _, w = m.decode(syndrome, return_weight=True)
+        _, w_pristine = build().decode(syndrome, return_weight=True)
+        assert w == w_pristine
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
