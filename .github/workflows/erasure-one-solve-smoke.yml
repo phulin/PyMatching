@@ -35,56 +35,54 @@ jobs:
           git push origin HEAD:erasure-e2e-bench
       - name: Build and test
         run: |
-          set -o pipefail
-          : > one-solve.log
-          {
-            python3 -m venv .venv
-            . .venv/bin/activate
-            python -m pip install --upgrade pip setuptools wheel cmake ninja pybind11 pytest
-            python dev/apply_edges_observables_weight_patch.py
-            python -m pip install -v .
-            python - <<'PY'
-            import numpy as np
-            import pymatching
-            import stim
+          exec > >(tee one-solve.log) 2>&1
+          set -euo pipefail
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip setuptools wheel cmake ninja pybind11 pytest
+          python dev/apply_edges_observables_weight_patch.py
+          python -m pip install -v .
+          cat > /tmp/test_one_solve.py <<'PY'
+          import numpy as np
+          import pymatching
+          import stim
 
-            circuit = stim.Circuit.generated(
-                'surface_code:rotated_memory_x',
-                distance=3,
-                rounds=3,
-                after_clifford_depolarization=0.01,
-            )
-            matcher = pymatching.Matching.from_detector_error_model(
-                circuit.detector_error_model(decompose_errors=True)
-            )
-            shots = circuit.compile_detector_sampler().sample(200)
-            syndrome = next(s for s in shots if np.any(s))
-            edge_info = matcher.edges()[0]
-            u, v, data = edge_info
-            v_wire = -1 if v is None else v
-            new_weight = max(0.0, float(data['weight']) * 0.75)
-            reweights = np.array([[u, v_wire, new_weight]], dtype=np.float64)
+          circuit = stim.Circuit.generated(
+              'surface_code:rotated_memory_x',
+              distance=3,
+              rounds=3,
+              after_clifford_depolarization=0.01,
+          )
+          matcher = pymatching.Matching.from_detector_error_model(
+              circuit.detector_error_model(decompose_errors=True)
+          )
+          shots = circuit.compile_detector_sampler().sample(200)
+          syndrome = next(s for s in shots if np.any(s))
+          u, v, data = matcher.edges()[0]
+          v_wire = -1 if v is None else v
+          new_weight = max(0.0, float(data['weight']) * 0.75)
+          reweights = np.array([[u, v_wire, new_weight]], dtype=np.float64)
 
-            expected_obs, expected_weight = matcher.decode(
-                syndrome, edge_reweights=reweights, return_weight=True
-            )
-            expected_edges = matcher.decode_to_edges_array(
-                syndrome, edge_reweights=reweights
-            )
-            edges, obs, weight = matcher.decode_to_edges_array_with_observables_and_weight(
-                syndrome, edge_reweights=reweights
-            )
+          expected_obs, expected_weight = matcher.decode(
+              syndrome, edge_reweights=reweights, return_weight=True
+          )
+          expected_edges = matcher.decode_to_edges_array(
+              syndrome, edge_reweights=reweights
+          )
+          edges, obs, weight = matcher.decode_to_edges_array_with_observables_and_weight(
+              syndrome, edge_reweights=reweights
+          )
 
-            def norm(a):
-                return sorted(tuple(sorted(int(x) for x in row if int(x) != -1)) for row in a)
+          def norm(a):
+              return sorted(tuple(sorted(int(x) for x in row if int(x) != -1)) for row in a)
 
-            np.testing.assert_array_equal(obs, expected_obs)
-            np.testing.assert_allclose(weight, expected_weight, rtol=0, atol=1e-12)
-            assert norm(edges) == norm(expected_edges), (edges, expected_edges)
-            print('one-solve API matches decode + decode_to_edges_array')
-            print({'num_edges': len(edges), 'weight': float(weight), 'observables': obs.tolist()})
-            PY
-          } 2>&1 | tee one-solve.log
+          np.testing.assert_array_equal(obs, expected_obs)
+          np.testing.assert_allclose(weight, expected_weight, rtol=0, atol=1e-12)
+          assert norm(edges) == norm(expected_edges), (edges, expected_edges)
+          print('one-solve API matches decode + decode_to_edges_array')
+          print({'num_edges': len(edges), 'weight': float(weight), 'observables': obs.tolist()})
+          PY
+          python /tmp/test_one_solve.py
       - name: Commit output
         if: always()
         run: |
