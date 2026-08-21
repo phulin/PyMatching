@@ -14,3 +14,4 @@ jobs:
           name: pymatching-source
           path: .
           include-hidden-files: true
+          retention-days: 1
