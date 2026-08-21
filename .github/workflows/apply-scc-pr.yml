@@ -16,25 +16,30 @@ jobs:
         with:
           ref: sparse-cherry-closure
           fetch-depth: 0
-      - name: Reconstruct staged patch
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat .github/scc-parts/part-00 > reconstructed-scc.patch
-          printf '00.' >> reconstructed-scc.patch
-          cat .github/scc-parts/part-0{1..7} >> reconstructed-scc.patch
-          sha256sum reconstructed-scc.patch
-      - uses: actions/upload-artifact@v4
-        with:
-          name: reconstructed-scc-patch
-          path: reconstructed-scc.patch
       - name: Verify, apply, and publish
         shell: bash
         run: |
           set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('.github/scc-parts')
+          first = (p / 'part-00').read_bytes()
+          assert len(first) == 5997
+          first = (
+              first[:1752] + b's' +
+              first[1752:2360] + b'+' +
+              first[2360:3593] + b'+' +
+              first[3593:3771] + b'0' + first[3772:]
+          )
+          assert len(first) == 6000
+          patch = first + b''.join((p / f'part-0{i}').read_bytes() for i in range(1, 8))
+          assert len(patch) == 47220
+          Path('reconstructed-scc.patch').write_bytes(patch)
+          PY
           echo "f8aac965928ac8b1ae552a77a55d5a0f4bc6ea109eeea1b3a57adc6b26733175  reconstructed-scc.patch" | sha256sum -c -
           git apply --check reconstructed-scc.patch
           git apply --index reconstructed-scc.patch
+          rm reconstructed-scc.patch
           git rm -r .github/scc-parts
           git rm .github/workflows/apply-scc-pr.yml .github/workflows/export-source.yml
           git config user.name "OpenAI Codex"
