@@ -1,10 +1,26 @@
+// Copyright 2026 PyMatching Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -47,6 +63,107 @@ static uint64_t mix64(uint64_t x) {
     x ^= x >> 27;
     x *= 0x94d049bb133111ebULL;
     return x ^ (x >> 31);
+}
+
+
+template <typename T>
+static T read_binary(std::ifstream &in) {
+    T value{};
+    in.read(reinterpret_cast<char *>(&value), sizeof(value));
+    if (!in) throw std::runtime_error("truncated benchmark input");
+    return value;
+}
+
+struct LoadedSurface {
+    pm::MatchingGraph graph;
+    std::vector<std::vector<size_t>> shots;
+    double normalising_constant;
+};
+
+static LoadedSurface load_surface(const std::string &graph_path, const std::string &shots_path) {
+    std::ifstream graph_file(graph_path, std::ios::binary);
+    if (!graph_file) throw std::runtime_error("failed to open graph input");
+    char magic[8];
+    graph_file.read(magic, sizeof(magic));
+    if (!graph_file || std::string(magic, magic + 6) != "PMDEM1") {
+        throw std::runtime_error("bad graph input magic");
+    }
+    uint64_t num_nodes = read_binary<uint64_t>(graph_file);
+    uint64_t num_observables = read_binary<uint64_t>(graph_file);
+    uint64_t num_edges = read_binary<uint64_t>(graph_file);
+    double normalising_constant = read_binary<double>(graph_file);
+    pm::MatchingGraph graph(num_nodes, num_observables, normalising_constant);
+    for (uint64_t i = 0; i < num_edges; i++) {
+        uint64_t u = read_binary<uint64_t>(graph_file);
+        int64_t v = read_binary<int64_t>(graph_file);
+        int32_t weight = read_binary<int32_t>(graph_file);
+        uint64_t obs_mask = read_binary<uint64_t>(graph_file);
+        std::vector<size_t> observables;
+        for (size_t b = 0; b < 64; b++) {
+            if ((obs_mask >> b) & 1) observables.push_back(b);
+        }
+        if (v < 0) {
+            graph.add_boundary_edge(u, weight, observables, {});
+        } else {
+            graph.add_edge(u, (uint64_t)v, weight, observables, {});
+        }
+    }
+
+    std::ifstream shots_file(shots_path, std::ios::binary | std::ios::ate);
+    if (!shots_file) throw std::runtime_error("failed to open shot input");
+    auto bytes = shots_file.tellg();
+    shots_file.seekg(0);
+    size_t shot_bytes = (num_nodes + num_observables + 7) / 8;
+    if (bytes < 0 || (size_t)bytes % shot_bytes != 0) throw std::runtime_error("bad b8 shot size");
+    std::vector<uint8_t> packed((size_t)bytes);
+    shots_file.read(reinterpret_cast<char *>(packed.data()), packed.size());
+    if (!shots_file) throw std::runtime_error("truncated b8 shot input");
+    size_t num_shots = packed.size() / shot_bytes;
+    std::vector<std::vector<size_t>> shots;
+    shots.reserve(num_shots);
+    for (size_t s = 0; s < num_shots; s++) {
+        std::vector<size_t> syndrome;
+        const uint8_t *row = packed.data() + s * shot_bytes;
+        for (size_t d = 0; d < num_nodes; d++) {
+            if ((row[d >> 3] >> (d & 7)) & 1) syndrome.push_back(d);
+        }
+        shots.push_back(std::move(syndrome));
+    }
+    return {std::move(graph), std::move(shots), normalising_constant};
+}
+
+static void run_surface(
+    const std::string &graph_path, const std::string &shots_path, size_t loops, size_t dump_count) {
+    auto surface = load_surface(graph_path, shots_path);
+    size_t nodes = surface.graph.nodes.size();
+    double mean_detection = 0;
+    for (const auto &s : surface.shots) mean_detection += s.size();
+    mean_detection /= surface.shots.size();
+    pm::Mwpm mwpm(pm::GraphFlooder(std::move(surface.graph)));
+    for (size_t i = 0; i < std::min<size_t>(surface.shots.size(), 20); i++) decode(mwpm, surface.shots[i]);
+    if (dump_count != 0) {
+        for (size_t i = 0; i < std::min(dump_count, surface.shots.size()); i++) {
+            auto r = decode(mwpm, surface.shots[i]);
+            std::cout << i << ',' << r.weight << ',' << r.weight / surface.normalising_constant << ','
+                      << r.obs_mask << '\n';
+        }
+        return;
+    }
+    uint64_t weight_checksum = 0;
+    uint64_t mask_checksum = 0;
+    auto start = std::chrono::steady_clock::now();
+    for (size_t loop = 0; loop < loops; loop++) {
+        for (size_t i = 0; i < surface.shots.size(); i++) {
+            auto r = decode(mwpm, surface.shots[i]);
+            weight_checksum += mix64((uint64_t)r.weight + i * 17 + loop * 131);
+            mask_checksum += mix64(r.obs_mask + i * 19 + loop * 137);
+        }
+    }
+    auto end = std::chrono::steady_clock::now();
+    double us = std::chrono::duration<double, std::micro>(end - start).count();
+    size_t decodes = loops * surface.shots.size();
+    std::cout << "surface_d13_p001," << nodes << ',' << surface.shots.size() << ',' << mean_detection << ','
+              << loops << ',' << us / decodes << ',' << weight_checksum << ',' << mask_checksum << '\n';
 }
 
 struct Scenario {
@@ -141,8 +258,12 @@ static Scenario make_scenario(const std::string &name) {
     throw std::invalid_argument("unknown scenario");
 }
 
-static void run_scenario(const std::string &name) {
+static void run_scenario(const std::string &name, size_t loop_multiplier) {
     auto scenario = make_scenario(name);
+    if (loop_multiplier == 0 || scenario.loops > SIZE_MAX / loop_multiplier) {
+        throw std::invalid_argument("invalid loop multiplier");
+    }
+    scenario.loops *= loop_multiplier;
     double mean_detection = 0;
     for (const auto &s : scenario.shots) mean_detection += s.size();
     mean_detection /= scenario.shots.size();
@@ -200,8 +321,15 @@ int main(int argc, char **argv) {
     if (argc >= 2 && std::string(argv[1]) == "chain") {
         if (argc != 4) return 2;
         run_chain(std::strtoull(argv[2], nullptr, 10), std::strtoull(argv[3], nullptr, 10));
+    } else if (argc >= 2 && std::string(argv[1]) == "surface") {
+        if (argc != 5) return 2;
+        run_surface(argv[2], argv[3], std::strtoull(argv[4], nullptr, 10), 0);
+    } else if (argc >= 2 && std::string(argv[1]) == "surface_dump") {
+        if (argc != 5) return 2;
+        run_surface(argv[2], argv[3], 0, std::strtoull(argv[4], nullptr, 10));
     } else {
-        if (argc != 2) return 2;
-        run_scenario(argv[1]);
+        if (argc != 2 && argc != 3) return 2;
+        size_t loop_multiplier = argc == 3 ? std::strtoull(argv[2], nullptr, 10) : 1;
+        run_scenario(argv[1], loop_multiplier);
     }
 }
