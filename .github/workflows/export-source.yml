@@ -2,6 +2,8 @@ name: Export source
 on:
   push:
     branches: [sparse-cherry-closure]
+  pull_request:
+    branches: [master]
 jobs:
   export:
     runs-on: ubuntu-latest
