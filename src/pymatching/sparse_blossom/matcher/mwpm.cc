@@ -304,7 +304,7 @@ GraphFillRegion *Mwpm::pair_and_shatter_subblossoms_and_extract_matches(GraphFil
     for (auto &r : region->blossom_children) {
         r.region->clear_blossom_parent_ignoring_wrapped_radius();
     }
-    auto subblossom = region->match.edge.loc_from->region_that_arrived_top;
+    auto subblossom = region->match.edge.loc_from->top_region();
     subblossom->match = region->match;
     if (subblossom->match.region)
         subblossom->match.region->match.region = subblossom;
@@ -363,7 +363,7 @@ GraphFillRegion *Mwpm::pair_and_shatter_subblossoms_and_extract_match_edges(
     for (auto &r : region->blossom_children) {
         r.region->clear_blossom_parent_ignoring_wrapped_radius();
     }
-    auto subblossom = region->match.edge.loc_from->region_that_arrived_top;
+    auto subblossom = region->match.edge.loc_from->top_region();
     subblossom->match = region->match;
     if (subblossom->match.region)
         subblossom->match.region->match.region = subblossom;

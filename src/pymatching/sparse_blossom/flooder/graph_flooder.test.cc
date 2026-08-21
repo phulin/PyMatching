@@ -56,3 +56,57 @@ TEST(GraphFlooder, PriorityQueue) {
     ASSERT_EQ(e6.data_look_at_shrinking_region, &gfr);
     ASSERT_EQ(flooder.dequeue_valid().time, 100);
 }
+
+TEST(GraphFlooder, blossom_frontier_inheritance_only_rebuilds_changed_slopes) {
+    GraphFlooder flooder(MatchingGraph(3, 0));
+    flooder.queue.cur_time = 10;
+
+    GraphFillRegion growing_left;
+    GraphFillRegion frozen_middle;
+    GraphFillRegion growing_right;
+    auto &left_node = flooder.graph.nodes[0];
+    auto &middle_node = flooder.graph.nodes[1];
+    auto &right_node = flooder.graph.nodes[2];
+
+    auto initialize_node = [&](DetectorNode &node, GraphFillRegion &region) {
+        node.reached_from_source = &node;
+        node.region_that_arrived = &region;
+        node.region_that_arrived_top = &region;
+        node.radius_of_arrival = 0;
+        node.wrapped_radius_cached = 0;
+        region.shell_area.push_back(&node);
+        node.node_event_tracker.set_desired_event({&node, cyclic_time_int{20}}, flooder.queue);
+    };
+    initialize_node(left_node, growing_left);
+    initialize_node(middle_node, frozen_middle);
+    initialize_node(right_node, growing_right);
+
+    growing_left.radius = VaryingCT::growing_value_at_time(3, 10);
+    frozen_middle.radius = VaryingCT::frozen(7);
+    growing_right.radius = VaryingCT::growing_value_at_time(5, 10);
+
+    std::vector<RegionEdge> children{
+        {&growing_left, {}},
+        {&frozen_middle, {}},
+        {&growing_right, {}},
+    };
+    auto *blossom = flooder.create_blossom(children);
+
+    // Growing children retain their already-valid frontier events. The frozen
+    // child changed slope and was therefore rescheduled (to no event here,
+    // because this test graph has no edges).
+    ASSERT_TRUE(left_node.node_event_tracker.has_desired_time);
+    ASSERT_EQ(left_node.node_event_tracker.desired_time, cyclic_time_int{20});
+    ASSERT_FALSE(middle_node.node_event_tracker.has_desired_time);
+    ASSERT_TRUE(right_node.node_event_tracker.has_desired_time);
+    ASSERT_EQ(right_node.node_event_tracker.desired_time, cyclic_time_int{20});
+
+    // Wrapping a growing child into a growing blossom preserves its trajectory.
+    ASSERT_EQ(left_node.local_radius().get_distance_at_time(25), 18);
+    ASSERT_EQ(right_node.local_radius().get_distance_at_time(25), 20);
+    // The frozen child acquires the new blossom's growth.
+    ASSERT_EQ(middle_node.local_radius().get_distance_at_time(25), 22);
+    ASSERT_EQ(left_node.top_region(), blossom);
+    ASSERT_EQ(middle_node.top_region(), blossom);
+    ASSERT_EQ(right_node.top_region(), blossom);
+}

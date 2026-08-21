@@ -28,9 +28,13 @@ class AltTreeNode;
 
 struct GraphFillRegion {
     /// If this region has merged with others into a blossom, this is that blossom.
+    /// This pointer is authoritative. In particular, unlike blossom_parent_top it is
+    /// always updated eagerly when a blossom is contracted.
     GraphFillRegion* blossom_parent;
-    /// The topmost fill region that contains this region. This field must be kept up to date as
-    /// the region structure changes.
+    /// A cache of the topmost fill region containing this region. The cache is
+    /// allowed to lag behind blossom_parent during nested contraction; call
+    /// top_region() before relying on it. It is repaired eagerly before a former
+    /// blossom parent is freed during shattering.
     GraphFillRegion* blossom_parent_top;
     /// If this is a top-level region (not a blossom child), this is the alternating tree that
     /// it is part of. Note that it may be a degenerate alternating tree with just a single
@@ -64,6 +68,11 @@ struct GraphFillRegion {
     bool tree_equal(const pm::GraphFillRegion& other) const;
 
     void add_match(pm::GraphFillRegion* match, const pm::CompressedEdge& edge);
+
+    /// Returns the actual top-level region by following authoritative parent links.
+    /// The non-const overload refreshes this region's blossom_parent_top cache.
+    GraphFillRegion* top_region();
+    const GraphFillRegion* top_region() const;
 
     template <typename Callable>
     void do_op_for_each_node_in_total_area(const Callable& func);

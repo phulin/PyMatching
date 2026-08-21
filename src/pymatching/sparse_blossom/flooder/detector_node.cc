@@ -14,23 +14,60 @@
 
 #include "pymatching/sparse_blossom/flooder/detector_node.h"
 
+#include <limits>
 #include <optional>
+#include <stdexcept>
 
 #include "pymatching/sparse_blossom/flooder/graph_fill_region.h"
 
 namespace pm {
 
+GraphFillRegion *DetectorNode::resolve_top_region() const {
+    GraphFillRegion *result = region_that_arrived_top;
+    if (result == nullptr) {
+        return nullptr;
+    }
+
+    cumulative_time_int new_wrapped_radius = wrapped_radius_cached;
+    while (result->blossom_parent != nullptr) {
+        // A region can only become a non-top child at the instant it is frozen
+        // into a new blossom. Crossing a varying region would mean the geometry
+        // and the dual state have diverged.
+        if (!result->radius.is_frozen()) {
+            throw std::logic_error("A lazily nested blossom region was not frozen.");
+        }
+        new_wrapped_radius += result->radius.y_intercept();
+        result = result->blossom_parent;
+    }
+
+    if (new_wrapped_radius < std::numeric_limits<int32_t>::min() ||
+        new_wrapped_radius > std::numeric_limits<int32_t>::max()) {
+        throw std::overflow_error("Wrapped blossom radius exceeded int32_t range.");
+    }
+    wrapped_radius_cached = (int32_t)new_wrapped_radius;
+    region_that_arrived_top = result;
+    return result;
+}
+
 int32_t DetectorNode::compute_wrapped_radius() const {
     if (reached_from_source == nullptr) {
         return 0;
     }
-    int32_t total = 0;
+    GraphFillRegion *top = top_region();
+    cumulative_time_int total = 0;
     auto r = region_that_arrived;
-    while (r != region_that_arrived_top) {
+    while (r != top) {
+        if (r == nullptr) {
+            throw std::logic_error("Detector ownership chain did not reach its top region.");
+        }
         total += r->radius.y_intercept();
         r = r->blossom_parent;
     }
-    return total - radius_of_arrival;
+    total -= radius_of_arrival;
+    if (total < std::numeric_limits<int32_t>::min() || total > std::numeric_limits<int32_t>::max()) {
+        throw std::overflow_error("Wrapped blossom radius exceeded int32_t range.");
+    }
+    return (int32_t)total;
 }
 
 void DetectorNode::reset() {
@@ -53,14 +90,16 @@ size_t DetectorNode::index_of_neighbor(DetectorNode *target) const {
 }
 
 GraphFillRegion *DetectorNode::heir_region_on_shatter() const {
+    GraphFillRegion *top = top_region();
     GraphFillRegion *r = region_that_arrived;
-    while (true) {
+    while (r != nullptr) {
         GraphFillRegion *p = r->blossom_parent;
-        if (p == region_that_arrived_top) {
+        if (p == top) {
             return r;
         }
         r = p;
     }
+    throw std::logic_error("Detector node had no heir region inside the shattering blossom.");
 }
 
 cumulative_time_int DetectorNode::compute_local_radius_at_time_bounded_by_region(
@@ -111,7 +150,7 @@ std::optional<float> DetectorNode::compute_stitch_radius_at_time_bounded_by_regi
 
     // If the nodes at either side of the edge have regions that aren't linked according to the
     // state the mwpm, then the transition must be happening exactly at the local radius.
-    if (r1 + r2 < max_w || neighbor->region_that_arrived_top != region_that_arrived_top) {
+    if (r1 + r2 < max_w || neighbor->top_region() != top_region()) {
         return (weight_int)r1;
     }
     if (r1 == max_w && *neighbor->region_that_arrived > *region_that_arrived) {

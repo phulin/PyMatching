@@ -66,6 +66,23 @@ void GraphFillRegion::add_match(GraphFillRegion *region, const CompressedEdge &e
     region->match = Match{this, edge.reversed()};
 }
 
+GraphFillRegion *GraphFillRegion::top_region() {
+    GraphFillRegion *result = this;
+    while (result->blossom_parent != nullptr) {
+        result = result->blossom_parent;
+    }
+    blossom_parent_top = result;
+    return result;
+}
+
+const GraphFillRegion *GraphFillRegion::top_region() const {
+    const GraphFillRegion *result = this;
+    while (result->blossom_parent != nullptr) {
+        result = result->blossom_parent;
+    }
+    return result;
+}
+
 void GraphFillRegion::cleanup_shell_area() {
     for (auto &detector_node : shell_area) {
         detector_node->reset();
@@ -77,6 +94,8 @@ void GraphFillRegion::clear_blossom_parent() {
     do_op_for_each_descendant_and_self([&](GraphFillRegion *descendant) {
         descendant->blossom_parent_top = this;
         for (DetectorNode *n : descendant->shell_area) {
+            // Re-establish an eager, self-contained cache before the former
+            // parent blossom can be recycled by the arena.
             n->region_that_arrived_top = this;
             n->wrapped_radius_cached = n->compute_wrapped_radius();
         }
@@ -88,20 +107,21 @@ void GraphFillRegion::clear_blossom_parent_ignoring_wrapped_radius() {
     do_op_for_each_descendant_and_self([&](GraphFillRegion *descendant) {
         descendant->blossom_parent_top = this;
         for (DetectorNode *n : descendant->shell_area) {
+            // Matching extraction will reset these nodes without consulting
+            // their radii. The pointer still has to be repaired because the
+            // former parent blossom is about to be destroyed.
             n->region_that_arrived_top = this;
         }
     });
 }
 
 void GraphFillRegion::wrap_into_blossom(GraphFillRegion *new_blossom_parent_and_top) {
+    // Parent links are the authoritative geometry. Descendant region and
+    // detector caches are deliberately left untouched and resolve lazily on
+    // their next radius/ownership query. This makes nested contraction O(1)
+    // instead of repeatedly walking the entire accumulated detector area.
     blossom_parent = new_blossom_parent_and_top;
-    do_op_for_each_descendant_and_self([&](GraphFillRegion *descendant) {
-        descendant->blossom_parent_top = new_blossom_parent_and_top;
-        for (DetectorNode *n : descendant->shell_area) {
-            n->region_that_arrived_top = new_blossom_parent_and_top;
-            n->wrapped_radius_cached = n->compute_wrapped_radius();
-        }
-    });
+    blossom_parent_top = new_blossom_parent_and_top;
 }
 
 bool GraphFillRegion::operator<=(const GraphFillRegion &rhs) const {

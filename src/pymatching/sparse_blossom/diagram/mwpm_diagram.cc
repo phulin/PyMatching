@@ -252,7 +252,7 @@ struct StateHelper {
     void draw_pending_collisions() {
         for (size_t k = 0; k < ns.size(); k++) {
             const auto &n = ns[k];
-            if (n.region_that_arrived_top == nullptr) {
+            if (n.top_region() == nullptr) {
                 continue;
             }
             auto ev = mwpm.flooder.find_next_event_at_node_returning_neighbor_index_and_time(n);
@@ -266,8 +266,7 @@ struct StateHelper {
                 if (r1.get_distance_at_time(t) + r2.get_distance_at_time(t) != n.neighbor_weights[ev.first]) {
                     continue;
                 }
-                if (m != nullptr && (m->region_that_arrived_top == nullptr ||
-                                     m->region_that_arrived_top == n.region_that_arrived_top)) {
+                if (m != nullptr && (m->top_region() == nullptr || m->top_region() == n.top_region())) {
                     continue;
                 }
                 auto col = lerp_pos(
@@ -281,7 +280,7 @@ struct StateHelper {
 
     void draw_match_edges() {
         for (auto *r : find_all_regions()) {
-            if (r->blossom_parent_top == r && r->radius.is_frozen()) {
+            if (r->top_region() == r && r->radius.is_frozen()) {
                 size_t k1 = r->match.edge.loc_from - &ns[0];
                 if (r->match.edge.loc_to == nullptr) {
                     out << " <line x1=\"" << coords[k1].first << "\" x2=\"" << boundary_coords[k1].first << "\" y1=\""
@@ -373,10 +372,11 @@ void pm::write_decoder_state_as_svg(
 
     for (auto *r : regions) {
         std::string color;
-        if (r->blossom_parent_top->radius.is_growing()) {
+        auto *top = r->top_region();
+        if (top->radius.is_growing()) {
             color = "#FF0000";
-        } else if (r->blossom_parent_top->radius.is_frozen()) {
-            if (r->blossom_parent_top->match.edge.loc_to == nullptr) {
+        } else if (top->radius.is_frozen()) {
+            if (top->match.edge.loc_to == nullptr) {
                 color = "#002000";
             } else {
                 color = "#00FF00";
@@ -434,7 +434,7 @@ void pm::write_animated_decoding_svg_frames(
     }
     auto check_if_done = [&]() {
         for (auto &detection : detection_events) {
-            if (!mwpm.flooder.graph.nodes[detection].region_that_arrived_top->radius.is_frozen()) {
+            if (!mwpm.flooder.graph.nodes[detection].top_region()->radius.is_frozen()) {
                 return false;
             }
         }
