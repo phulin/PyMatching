@@ -685,3 +685,46 @@ TEST(GraphFlooder, RegionGrowingThenFrozenThenStartShrinking) {
     ASSERT_EQ(
         flooder.dequeue_valid(), FloodCheckEvent(flooder.graph.nodes[2].region_that_arrived, cyclic_time_int{80 + 4}));
 }
+
+TEST(Mwpm, lazy_blossom_geometry_handles_deep_tight_cherry_chain) {
+    constexpr size_t k = 32;
+    constexpr size_t root = 0;
+    constexpr size_t terminal = 2 * k + 1;
+    auto x = [](size_t i) {
+        return 2 * i - 1;
+    };
+    auto y = [](size_t i) {
+        return 2 * i;
+    };
+
+    MatchingGraph graph(2 * k + 2, 0);
+    for (size_t i = 1; i <= k; i++) {
+        size_t attachment = i == 1 ? root : x(i - 1);
+        graph.add_edge(attachment, x(i), 2, {}, {});
+        graph.add_edge(attachment, y(i), 2, {}, {});
+        graph.add_edge(x(i), y(i), 2, {}, {});
+    }
+    graph.add_edge(x(k), terminal, 4, {}, {});
+
+    Mwpm mwpm(GraphFlooder(std::move(graph)));
+    for (auto &node : mwpm.flooder.graph.nodes) {
+        mwpm.create_detection_event(&node);
+    }
+    while (true) {
+        auto event = mwpm.flooder.run_until_next_mwpm_notification();
+        if (event.event_type == NO_EVENT) {
+            break;
+        }
+        mwpm.process_event(event);
+    }
+
+    ASSERT_EQ(mwpm.node_arena.allocated.size(), mwpm.node_arena.available.size());
+    MatchingResult result;
+    for (auto &node : mwpm.flooder.graph.nodes) {
+        if (node.region_that_arrived != nullptr) {
+            result += mwpm.shatter_blossom_and_extract_matches(node.top_region());
+        }
+    }
+    ASSERT_EQ(result.weight, 2 * k + 4);
+    ASSERT_EQ(result.obs_mask, 0);
+}

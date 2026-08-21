@@ -135,3 +135,39 @@ TEST(DetectorNode, compute_stitch_radius_at_time_bounded_by_region_towards_neigh
     ASSERT_EQ(left_node.compute_stitch_radius_at_time_bounded_by_region_towards_neighbor(100, parent, 0), 8.5);
     ASSERT_EQ(right_node.compute_stitch_radius_at_time_bounded_by_region_towards_neighbor(100, parent, 0), 11.5);
 }
+
+TEST(DetectorNode, lazy_blossom_top_resolution_preserves_local_radius) {
+    GraphFillRegion leaf;
+    GraphFillRegion middle;
+    GraphFillRegion top;
+    DetectorNode node;
+
+    node.reached_from_source = &node;
+    node.region_that_arrived = &leaf;
+    node.region_that_arrived_top = &leaf;
+    node.radius_of_arrival = 0;
+    node.wrapped_radius_cached = 0;
+    leaf.shell_area.push_back(&node);
+
+    leaf.radius = VaryingCT::frozen(5);
+    middle.radius = VaryingCT::frozen(7);
+    top.radius = VaryingCT::growing_value_at_time(0, 100);
+    leaf.wrap_into_blossom(&middle);
+    middle.wrap_into_blossom(&top);
+
+    // The detector cache still points at leaf. Resolving it should add both
+    // frozen offsets and recover the exact local-radius trajectory.
+    ASSERT_EQ(node.region_that_arrived_top, &leaf);
+    ASSERT_EQ(node.local_radius().get_distance_at_time(100), 12);
+    ASSERT_EQ(node.region_that_arrived_top, &top);
+    ASSERT_EQ(node.wrapped_radius_cached, 12);
+    ASSERT_EQ(node.local_radius().get_distance_at_time(113), 25);
+
+    // Shattering top makes middle top level. Its descendant and detector
+    // caches are eagerly repaired before top can be recycled.
+    middle.clear_blossom_parent();
+    ASSERT_EQ(leaf.top_region(), &middle);
+    ASSERT_EQ(node.region_that_arrived_top, &middle);
+    ASSERT_EQ(node.wrapped_radius_cached, 5);
+    ASSERT_EQ(node.local_radius().get_distance_at_time(100), 12);
+}

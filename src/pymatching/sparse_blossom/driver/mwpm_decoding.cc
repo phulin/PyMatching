@@ -150,7 +150,7 @@ pm::MatchingResult shatter_blossoms_for_all_detection_events_and_extract_obs_mas
     pm::MatchingResult res;
     for (auto& i : detection_events) {
         if (mwpm.flooder.graph.nodes[i].region_that_arrived)
-            res += mwpm.shatter_blossom_and_extract_matches(mwpm.flooder.graph.nodes[i].region_that_arrived_top);
+            res += mwpm.shatter_blossom_and_extract_matches(mwpm.flooder.graph.nodes[i].top_region());
     }
     return res;
 }
@@ -160,7 +160,7 @@ void shatter_blossoms_for_all_detection_events_and_extract_match_edges(
     for (auto& i : detection_events) {
         if (mwpm.flooder.graph.nodes[i].region_that_arrived)
             mwpm.shatter_blossom_and_extract_match_edges(
-                mwpm.flooder.graph.nodes[i].region_that_arrived_top, mwpm.flooder.match_edges);
+                mwpm.flooder.graph.nodes[i].top_region(), mwpm.flooder.match_edges);
     }
 }
 
