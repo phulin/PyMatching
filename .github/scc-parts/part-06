@@ -1,0 +1,110 @@
+unc);
+     template <typename Callable>
+diff --git a/src/pymatching/sparse_blossom/flooder/graph_fill_region.test.cc b/src/pymatching/sparse_blossom/flooder/graph_fill_region.test.cc
+index 978a96d..9134eed 100644
+--- a/src/pymatching/sparse_blossom/flooder/graph_fill_region.test.cc
++++ b/src/pymatching/sparse_blossom/flooder/graph_fill_region.test.cc
+@@ -39,8 +39,8 @@ TEST(GraphFillRegion, TopRegion) {
+              x.b(2, 0, {x.b(3, 4, {}, false), x.b(4, 5, {}, false), x.b(5, 3, {}, false)}, false)},
+             true);
+ 
+-    ASSERT_EQ(t.region, t.region->blossom_children[2].region->blossom_children[0].region->blossom_parent_top);
+-    ASSERT_EQ(t.region, t.region->blossom_children[1].region->blossom_parent_top);
++    ASSERT_EQ(t.region, t.region->blossom_children[2].region->blossom_children[0].region->top_region());
++    ASSERT_EQ(t.region, t.region->blossom_children[1].region->top_region());
+ }
+ 
+ TEST(GraphFillRegion, AddMatch) {
+diff --git a/src/pymatching/sparse_blossom/flooder/graph_flooder.cc b/src/pymatching/sparse_blossom/flooder/graph_flooder.cc
+index 9bf2afd..8501ba6 100644
+--- a/src/pymatching/sparse_blossom/flooder/graph_flooder.cc
++++ b/src/pymatching/sparse_blossom/flooder/graph_flooder.cc
+@@ -162,7 +162,7 @@ void GraphFlooder::do_region_arriving_at_empty_detector_node(
+     empty_node.reached_from_source = from_node.reached_from_source;
+     empty_node.radius_of_arrival = region.radius.get_distance_at_time(queue.cur_time);
+     empty_node.region_that_arrived = &region;
+-    empty_node.region_that_arrived_top = region.blossom_parent_top;
++    empty_node.region_that_arrived_top = region.top_region();
+     empty_node.wrapped_radius_cached = empty_node.compute_wrapped_radius();
+     region.shell_area.push_back(&empty_node);
+     reschedule_events_at_detector_node(empty_node);
+@@ -191,16 +191,16 @@ MwpmEvent GraphFlooder::do_region_shrinking(GraphFillRegion &region) {
+ MwpmEvent GraphFlooder::do_neighbor_interaction(DetectorNode &src, size_t src_to_dst_index, DetectorNode &dst) {
+     // First check if one region is moving into an empty location
+     if (src.region_that_arrived && !dst.region_that_arrived) {
+-        do_region_arriving_at_empty_detector_node(*src.region_that_arrived_top, dst, src, src_to_dst_index);
++        do_region_arriving_at_empty_detector_node(*src.top_region(), dst, src, src_to_dst_index);
+         return MwpmEvent::no_event();
+     } else if (dst.region_that_arrived && !src.region_that_arrived) {
+-        do_region_arriving_at_empty_detector_node(*dst.region_that_arrived_top, src, dst, dst.index_of_neighbor(&src));
++        do_region_arriving_at_empty_detector_node(*dst.top_region(), src, dst, dst.index_of_neighbor(&src));
+         return MwpmEvent::no_event();
+     } else {
+         // Two regions colliding
+         return RegionHitRegionEventData{
+-            src.region_that_arrived_top,
+-            dst.region_that_arrived_top,
++            src.top_region(),
++            dst.top_region(),
+             CompressedEdge{
+                 src.reached_from_source,
+                 dst.reached_from_source,
+@@ -212,7 +212,7 @@ MwpmEvent GraphFlooder::do_neighbor_interaction(DetectorNode &src, size_t src_to
+ 
+ MwpmEvent GraphFlooder::do_region_hit_boundary_interaction(DetectorNode &node) {
+     return RegionHitBoundaryEventData{
+-        node.region_that_arrived_top,
++        node.top_region(),
+         CompressedEdge{
+             node.reached_from_source, nullptr, node.observables_crossed_from_source ^ node.neighbor_observables[0]}};
+ }
+@@ -238,15 +238,27 @@ GraphFillRegion *GraphFlooder::create_blossom(std::vector<RegionEdge> &contained
+     auto blossom_region = region_arena.alloc_default_constructed();
+     blossom_region->radius = VaryingCT::growing_varying_with_zero_distance_at_time(queue.cur_time);
+     blossom_region->blossom_children = std::move(contained_regions);
++
++    // A growing child wrapped into a newly-growing blossom keeps exactly the
++    // same local-radius trajectory at every detector node. Its queued frontier
++    // events therefore remain valid. Only children whose slope changes to the
++    // parent's +1 need their detector event frontier rebuilt.
++    std::vector<GraphFillRegion *> changed_slope_children;
++    changed_slope_children.reserve(blossom_region->blossom_children.size());
+     for (auto &region_edge : blossom_region->blossom_children) {
++        if (!region_edge.region->radius.is_growing()) {
++            changed_slope_children.push_back(region_edge.region);
++        }
+         region_edge.region->radius = region_edge.region->radius.then_frozen_at_time(queue.cur_time);
+         region_edge.region->wrap_into_blossom(blossom_region);
+         region_edge.region->shrink_event_tracker.set_no_desired_event();
+     }
+ 
+-    blossom_region->do_op_for_each_node_in_total_area([this](DetectorNode *n) {
+-        reschedule_events_at_detector_node(*n);
+-    });
++    for (auto *child : changed_slope_children) {
++        child->do_op_for_each_node_in_total_area([this](DetectorNode *n) {
++            reschedule_events_at_detector_node(*n);
++        });
++    }
+ 
+     return blossom_region;
+ }
+diff --git a/src/pymatching/sparse_blossom/flooder/graph_flooder.test.cc b/src/pymatching/sparse_blossom/flooder/graph_flooder.test.cc
+index e3f2a0c..1023251 100644
+--- a/src/pymatching/sparse_blossom/flooder/graph_flooder.test.cc
++++ b/src/pymatching/sparse_blossom/flooder/graph_flooder.test.cc
+@@ -56,3 +56,57 @@ TEST(GraphFlooder, PriorityQueue) {
+     ASSERT_EQ(e6.data_look_at_shrinking_region, &gfr);
+     ASSERT_EQ(flooder.dequeue_valid().time, 100);
+ }
++
++TEST(GraphFlooder, blossom_frontier_inheritance_only_rebuilds_changed_slopes) {
++    GraphFlooder flooder(MatchingGraph(3, 0));
++    flooder.queue.cur_time = 10;
++
++    GraphFillRegion growing_left;
++    GraphFillRegion frozen_middle;
++    GraphFillRegion growing_right;
++    auto &left_node = flooder.graph.nodes[0];
++    auto &middle_node = flooder.graph.nodes[1];
++    auto &right_node = 

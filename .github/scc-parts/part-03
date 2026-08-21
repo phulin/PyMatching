@@ -1,0 +1,138 @@
+o ev = mwpm.flooder.find_next_event_at_node_returning_neighbor_index_and_time(n);
+@@ -266,8 +266,7 @@ struct StateHelper {
+                 if (r1.get_distance_at_time(t) + r2.get_distance_at_time(t) != n.neighbor_weights[ev.first]) {
+                     continue;
+                 }
+-                if (m != nullptr && (m->region_that_arrived_top == nullptr ||
+-                                     m->region_that_arrived_top == n.region_that_arrived_top)) {
++                if (m != nullptr && (m->top_region() == nullptr || m->top_region() == n.top_region())) {
+                     continue;
+                 }
+                 auto col = lerp_pos(
+@@ -281,7 +280,7 @@ struct StateHelper {
+ 
+     void draw_match_edges() {
+         for (auto *r : find_all_regions()) {
+-            if (r->blossom_parent_top == r && r->radius.is_frozen()) {
++            if (r->top_region() == r && r->radius.is_frozen()) {
+                 size_t k1 = r->match.edge.loc_from - &ns[0];
+                 if (r->match.edge.loc_to == nullptr) {
+                     out << " <line x1=\"" << coords[k1].first << "\" x2=\"" << boundary_coords[k1].first << "\" y1=\""
+@@ -373,10 +372,11 @@ void pm::write_decoder_state_as_svg(
+ 
+     for (auto *r : regions) {
+         std::string color;
+-        if (r->blossom_parent_top->radius.is_growing()) {
++        auto *top = r->top_region();
++        if (top->radius.is_growing()) {
+             color = "#FF0000";
+-        } else if (r->blossom_parent_top->radius.is_frozen()) {
+-            if (r->blossom_parent_top->match.edge.loc_to == nullptr) {
++        } else if (top->radius.is_frozen()) {
++            if (top->match.edge.loc_to == nullptr) {
+                 color = "#002000";
+             } else {
+                 color = "#00FF00";
+@@ -434,7 +434,7 @@ void pm::write_animated_decoding_svg_frames(
+     }
+     auto check_if_done = [&]() {
+         for (auto &detection : detection_events) {
+-            if (!mwpm.flooder.graph.nodes[detection].region_that_arrived_top->radius.is_frozen()) {
++            if (!mwpm.flooder.graph.nodes[detection].top_region()->radius.is_frozen()) {
+                 return false;
+             }
+         }
+diff --git a/src/pymatching/sparse_blossom/driver/mwpm_decoding.cc b/src/pymatching/sparse_blossom/driver/mwpm_decoding.cc
+index cc3ea83..ea55924 100644
+--- a/src/pymatching/sparse_blossom/driver/mwpm_decoding.cc
++++ b/src/pymatching/sparse_blossom/driver/mwpm_decoding.cc
+@@ -150,7 +150,7 @@ pm::MatchingResult shatter_blossoms_for_all_detection_events_and_extract_obs_mas
+     pm::MatchingResult res;
+     for (auto& i : detection_events) {
+         if (mwpm.flooder.graph.nodes[i].region_that_arrived)
+-            res += mwpm.shatter_blossom_and_extract_matches(mwpm.flooder.graph.nodes[i].region_that_arrived_top);
++            res += mwpm.shatter_blossom_and_extract_matches(mwpm.flooder.graph.nodes[i].top_region());
+     }
+     return res;
+ }
+@@ -160,7 +160,7 @@ void shatter_blossoms_for_all_detection_events_and_extract_match_edges(
+     for (auto& i : detection_events) {
+         if (mwpm.flooder.graph.nodes[i].region_that_arrived)
+             mwpm.shatter_blossom_and_extract_match_edges(
+-                mwpm.flooder.graph.nodes[i].region_that_arrived_top, mwpm.flooder.match_edges);
++                mwpm.flooder.graph.nodes[i].top_region(), mwpm.flooder.match_edges);
+     }
+ }
+ 
+diff --git a/src/pymatching/sparse_blossom/flooder/detector_node.cc b/src/pymatching/sparse_blossom/flooder/detector_node.cc
+index 3e90c71..485808a 100644
+--- a/src/pymatching/sparse_blossom/flooder/detector_node.cc
++++ b/src/pymatching/sparse_blossom/flooder/detector_node.cc
+@@ -14,23 +14,60 @@
+ 
+ #include "pymatching/sparse_blossom/flooder/detector_node.h"
+ 
++#include <limits>
+ #include <optional>
++#include <stdexcept>
+ 
+ #include "pymatching/sparse_blossom/flooder/graph_fill_region.h"
+ 
+ namespace pm {
+ 
++GraphFillRegion *DetectorNode::resolve_top_region() const {
++    GraphFillRegion *result = region_that_arrived_top;
++    if (result == nullptr) {
++        return nullptr;
++    }
++
++    cumulative_time_int new_wrapped_radius = wrapped_radius_cached;
++    while (result->blossom_parent != nullptr) {
++        // A region can only become a non-top child at the instant it is frozen
++        // into a new blossom. Crossing a varying region would mean the geometry
++        // and the dual state have diverged.
++        if (!result->radius.is_frozen()) {
++            throw std::logic_error("A lazily nested blossom region was not frozen.");
++        }
++        new_wrapped_radius += result->radius.y_intercept();
++        result = result->blossom_parent;
++    }
++
++    if (new_wrapped_radius < std::numeric_limits<int32_t>::min() ||
++        new_wrapped_radius > std::numeric_limits<int32_t>::max()) {
++        throw std::overflow_error("Wrapped blossom radius exceeded int32_t range.");
++    }
++    wrapped_radius_cached = (int32_t)new_wrapped_radius;
++    region_that_arrived_top = result;
++    return result;
++}
++
+ int32_t DetectorNode::compute_wrapped_radius() const {
+     if (reached_from_source == nullptr) {
+         return 0;
+     }
+-    int32_t total = 0;
++    GraphFillRegion *top = top_region();
++    cumulative_time_int total = 0;
+     auto r = region_that_arrived;
+-    while (r != region_that_arrived_top) {
++    while (r != top) {
++        if (r == nullptr) {
++            throw std::logic_error("Detector ownership chain did not reach its top region.");
++        }
+         total += r->radius.y_intercept();
+         r = r->blossom_parent;
+     }
+-    return total - radius_of_arrival;
++    total -= radius_of_arrival;
++    if (total < std::numeric_limits<int32_t>::min() || total > std::numeric_limits<int32_t>::max()) {
++        throw std::overflow_error("Wrapped blossom radius exceeded int32_t range.");
++    }
++    return (int32_t)total;
+ }
+ 
+ void DetectorNode::reset() {
+@@ -53,14 +90,16 @@ size_t DetectorNode::index_of_neighbor(DetectorNode *target) const {
+ }
+ 
+ GraphFillRegion *Det

@@ -1,0 +1,116 @@
+ectorNode::heir_region_on_shatter() const {
++    GraphFillRegion *top = top_region();
+     GraphFillRegion *r = region_that_arrived;
+-    while (true) {
++    while (r != nullptr) {
+         GraphFillRegion *p = r->blossom_parent;
+-        if (p == region_that_arrived_top) {
++        if (p == top) {
+             return r;
+         }
+         r = p;
+     }
++    throw std::logic_error("Detector node had no heir region inside the shattering blossom.");
+ }
+ 
+ cumulative_time_int DetectorNode::compute_local_radius_at_time_bounded_by_region(
+@@ -111,7 +150,7 @@ std::optional<float> DetectorNode::compute_stitch_radius_at_time_bounded_by_regi
+ 
+     // If the nodes at either side of the edge have regions that aren't linked according to the
+     // state the mwpm, then the transition must be happening exactly at the local radius.
+-    if (r1 + r2 < max_w || neighbor->region_that_arrived_top != region_that_arrived_top) {
++    if (r1 + r2 < max_w || neighbor->top_region() != top_region()) {
+         return (weight_int)r1;
+     }
+     if (r1 == max_w && *neighbor->region_that_arrived > *region_that_arrived) {
+diff --git a/src/pymatching/sparse_blossom/flooder/detector_node.h b/src/pymatching/sparse_blossom/flooder/detector_node.h
+index 446de58..024e9c8 100644
+--- a/src/pymatching/sparse_blossom/flooder/detector_node.h
++++ b/src/pymatching/sparse_blossom/flooder/detector_node.h
+@@ -46,12 +46,13 @@ class DetectorNode {
+     /// == Ephemeral fields used to track algorithmic state during matching. ==
+     /// The region that reached and owns this node.
+     GraphFillRegion* region_that_arrived;
+-    /// The topmost region containing this node. Must be kept up to date as
+-    /// the region structure changes.
+-    GraphFillRegion* region_that_arrived_top;
+-    /// Stores the latest value of `compute_wrapped_radius` so it doesn't need to be recomputed
+-    /// as much. Updated whenever region_that_arrived_top changes.
+-    int32_t wrapped_radius_cached;
++    /// A cache of the topmost region containing this node. A blossom contraction may
++    /// leave this pointing at a newly nested former top region. top_region() repairs the
++    /// cache lazily by following authoritative GraphFillRegion::blossom_parent links.
++    mutable GraphFillRegion* region_that_arrived_top;
++    /// The sum of frozen radii below region_that_arrived_top, minus radius_of_arrival.
++    /// It is extended lazily whenever top_region() crosses newly nested blossoms.
++    mutable int32_t wrapped_radius_cached;
+     /// Of the detection events within the owning region, which one is this node linked to.
+     DetectorNode* reached_from_source;
+     /// Which observables are crossed, travelling from this node to the source
+@@ -67,12 +68,24 @@ class DetectorNode {
+     std::vector<weight_int> neighbor_weights;   /// Distance crossed by the edge to each neighbor.
+     std::vector<obs_int> neighbor_observables;  /// Observables crossed by the edge to each neighbor.
+ 
++    /// Resolves and returns the actual top-level owner, lazily repairing the cached
++    /// top pointer and wrapped-radius offset. The common non-nested path is inline.
++    GraphFillRegion* resolve_top_region() const;
++    inline GraphFillRegion* top_region() const {
++        GraphFillRegion* result = region_that_arrived_top;
++        if (result != nullptr && result->blossom_parent != nullptr) [[unlikely]] {
++            result = resolve_top_region();
++        }
++        return result;
++    }
++
+     /// After it reached this node, how much further did the owning search region grow? Also is it currently growing?
+     inline VaryingCT local_radius() const {
+-        if (region_that_arrived_top == nullptr) {
++        GraphFillRegion* top = top_region();
++        if (top == nullptr) {
+             return VaryingCT{0};
+         }
+-        return region_that_arrived_top->radius + wrapped_radius_cached;
++        return top->radius + wrapped_radius_cached;
+     }
+ 
+     /// Determines the region that owns this node which is a child of this node's top region.
+@@ -81,7 +94,20 @@ class DetectorNode {
+     /// Check if this node is part the same top-level region as another.
+     /// Note that they may have different lower level owners that still merge into the same top level owned.
+     inline bool has_same_owner_as(const DetectorNode& other) const {
+-        return region_that_arrived_top == other.region_that_arrived_top;
++        GraphFillRegion* top1 = region_that_arrived_top;
++        GraphFillRegion* top2 = other.region_that_arrived_top;
++        if (top1 == top2) {
++            return true;
++        }
++        if (top1 == nullptr || top2 == nullptr) [[likely]] {
++            return false;
++        }
++        // Distinct cached owners that are both still top level cannot resolve to
++        // the same owner. This is the overwhelmingly common hot path.
++        if (top1->blossom_parent == nullptr && top2->blossom_parent == nullptr) [[likely]] {
++            return false;
++        }
++        return top_region() == other.top_region();
+     }
+ 
+     /// Zero all ephemeral fields.
+diff --git a/src/pymatching/sparse_blossom/flooder/detector_node.test.cc b/src/pymatching/sparse_blossom/flooder/detector_node.test.cc
+index 7cc2a56..1d85958 100644
+--- a/src/pymatching/sparse_blossom/flooder/detector_node.test.cc
++++ b/src/pymatching/sparse_blossom/flooder/detector_node.test.cc
+@@ -135,3 +135,39 @@ TEST(DetectorNode, compute_stitch_radius_at_time_bounded_by_region_towards_neigh
+     ASSERT_EQ(left_node.compute_stitch_radius_at_time_bounded_by_region_towards_neighbor(100, parent, 0), 8.5);
+     ASSERT_EQ(right_node.compute_stitch_radius_at_time_bounded_by_region_towards_neighbor(100, parent, 0), 11.5);
+ }
++
++TEST(DetectorNode, lazy_blossom_top_resolution_preserves_local_radius) {
++    GraphFillRegion leaf;
++    GraphFillRegion middle;
++    GraphFillRegion top;
++    DetectorNode node;
++
++    node.reached_from_source = &node;
++    node.region_that_arrived = &leaf;
++    node.region_that_arrived_t

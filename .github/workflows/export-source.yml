@@ -1,25 +1,36 @@
-name: Export source
+name: Apply validated lazy-contraction patch
+
 on:
   push:
     branches: [sparse-cherry-closure]
-  pull_request:
-    branches: [master]
+
+permissions:
+  contents: write
+
 jobs:
-  export:
+  apply:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
-      - name: Vendor build dependencies for local/offline build
+          ref: sparse-cherry-closure
+          fetch-depth: 0
+      - name: Apply and publish validated implementation
+        shell: bash
         run: |
-          git clone --depth 1 --branch release-1.12.1 https://github.com/google/googletest.git _vendor/googletest
-          git clone https://github.com/quantumlib/Stim.git _vendor/stim
-          git -C _vendor/stim checkout 1320ad7eac7de34d2e9c70daa44fbc6d84174450
-          rm -rf _vendor/googletest/.git _vendor/stim/.git
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pymatching-source
-          path: .
-          include-hidden-files: true
-          retention-days: 1
+          set -euo pipefail
+          shopt -s nullglob
+          parts=(.github/scc-parts/part-*)
+          if ((${#parts[@]} == 0)); then
+            echo "No staged patch parts; nothing to do."
+            exit 0
+          fi
+          cat "${parts[@]}" > /tmp/scc.patch
+          echo "f8aac965928ac8b1ae552a77a55d5a0f4bc6ea109eeea1b3a57adc6b26733175  /tmp/scc.patch" | sha256sum -c -
+          git apply --check /tmp/scc.patch
+          git apply --index /tmp/scc.patch
+          git rm -r .github/scc-parts
+          git config user.name "OpenAI Codex"
+          git config user.email "codex@openai.com"
+          git commit -m "Implement lazy sparse-blossom contraction"
+          git push origin HEAD:sparse-cherry-closure

@@ -1,0 +1,124 @@
+op = &leaf;
++    node.radius_of_arrival = 0;
++    node.wrapped_radius_cached = 0;
++    leaf.shell_area.push_back(&node);
++
++    leaf.radius = VaryingCT::frozen(5);
++    middle.radius = VaryingCT::frozen(7);
++    top.radius = VaryingCT::growing_value_at_time(0, 100);
++    leaf.wrap_into_blossom(&middle);
++    middle.wrap_into_blossom(&top);
++
++    // The detector cache still points at leaf. Resolving it should add both
++    // frozen offsets and recover the exact local-radius trajectory.
++    ASSERT_EQ(node.region_that_arrived_top, &leaf);
++    ASSERT_EQ(node.local_radius().get_distance_at_time(100), 12);
++    ASSERT_EQ(node.region_that_arrived_top, &top);
++    ASSERT_EQ(node.wrapped_radius_cached, 12);
++    ASSERT_EQ(node.local_radius().get_distance_at_time(113), 25);
++
++    // Shattering top makes middle top level. Its descendant and detector
++    // caches are eagerly repaired before top can be recycled.
++    middle.clear_blossom_parent();
++    ASSERT_EQ(leaf.top_region(), &middle);
++    ASSERT_EQ(node.region_that_arrived_top, &middle);
++    ASSERT_EQ(node.wrapped_radius_cached, 5);
++    ASSERT_EQ(node.local_radius().get_distance_at_time(100), 12);
++}
+diff --git a/src/pymatching/sparse_blossom/flooder/graph_fill_region.cc b/src/pymatching/sparse_blossom/flooder/graph_fill_region.cc
+index 8543fcc..5dca53a 100644
+--- a/src/pymatching/sparse_blossom/flooder/graph_fill_region.cc
++++ b/src/pymatching/sparse_blossom/flooder/graph_fill_region.cc
+@@ -66,6 +66,23 @@ void GraphFillRegion::add_match(GraphFillRegion *region, const CompressedEdge &e
+     region->match = Match{this, edge.reversed()};
+ }
+ 
++GraphFillRegion *GraphFillRegion::top_region() {
++    GraphFillRegion *result = this;
++    while (result->blossom_parent != nullptr) {
++        result = result->blossom_parent;
++    }
++    blossom_parent_top = result;
++    return result;
++}
++
++const GraphFillRegion *GraphFillRegion::top_region() const {
++    const GraphFillRegion *result = this;
++    while (result->blossom_parent != nullptr) {
++        result = result->blossom_parent;
++    }
++    return result;
++}
++
+ void GraphFillRegion::cleanup_shell_area() {
+     for (auto &detector_node : shell_area) {
+         detector_node->reset();
+@@ -77,6 +94,8 @@ void GraphFillRegion::clear_blossom_parent() {
+     do_op_for_each_descendant_and_self([&](GraphFillRegion *descendant) {
+         descendant->blossom_parent_top = this;
+         for (DetectorNode *n : descendant->shell_area) {
++            // Re-establish an eager, self-contained cache before the former
++            // parent blossom can be recycled by the arena.
+             n->region_that_arrived_top = this;
+             n->wrapped_radius_cached = n->compute_wrapped_radius();
+         }
+@@ -88,20 +107,21 @@ void GraphFillRegion::clear_blossom_parent_ignoring_wrapped_radius() {
+     do_op_for_each_descendant_and_self([&](GraphFillRegion *descendant) {
+         descendant->blossom_parent_top = this;
+         for (DetectorNode *n : descendant->shell_area) {
++            // Matching extraction will reset these nodes without consulting
++            // their radii. The pointer still has to be repaired because the
++            // former parent blossom is about to be destroyed.
+             n->region_that_arrived_top = this;
+         }
+     });
+ }
+ 
+ void GraphFillRegion::wrap_into_blossom(GraphFillRegion *new_blossom_parent_and_top) {
++    // Parent links are the authoritative geometry. Descendant region and
++    // detector caches are deliberately left untouched and resolve lazily on
++    // their next radius/ownership query. This makes nested contraction O(1)
++    // instead of repeatedly walking the entire accumulated detector area.
+     blossom_parent = new_blossom_parent_and_top;
+-    do_op_for_each_descendant_and_self([&](GraphFillRegion *descendant) {
+-        descendant->blossom_parent_top = new_blossom_parent_and_top;
+-        for (DetectorNode *n : descendant->shell_area) {
+-            n->region_that_arrived_top = new_blossom_parent_and_top;
+-            n->wrapped_radius_cached = n->compute_wrapped_radius();
+-        }
+-    });
++    blossom_parent_top = new_blossom_parent_and_top;
+ }
+ 
+ bool GraphFillRegion::operator<=(const GraphFillRegion &rhs) const {
+diff --git a/src/pymatching/sparse_blossom/flooder/graph_fill_region.h b/src/pymatching/sparse_blossom/flooder/graph_fill_region.h
+index df543d0..3da2f11 100644
+--- a/src/pymatching/sparse_blossom/flooder/graph_fill_region.h
++++ b/src/pymatching/sparse_blossom/flooder/graph_fill_region.h
+@@ -28,9 +28,13 @@ class AltTreeNode;
+ 
+ struct GraphFillRegion {
+     /// If this region has merged with others into a blossom, this is that blossom.
++    /// This pointer is authoritative. In particular, unlike blossom_parent_top it is
++    /// always updated eagerly when a blossom is contracted.
+     GraphFillRegion* blossom_parent;
+-    /// The topmost fill region that contains this region. This field must be kept up to date as
+-    /// the region structure changes.
++    /// A cache of the topmost fill region containing this region. The cache is
++    /// allowed to lag behind blossom_parent during nested contraction; call
++    /// top_region() before relying on it. It is repaired eagerly before a former
++    /// blossom parent is freed during shattering.
+     GraphFillRegion* blossom_parent_top;
+     /// If this is a top-level region (not a blossom child), this is the alternating tree that
+     /// it is part of. Note that it may be a degenerate alternating tree with just a single
+@@ -65,6 +69,11 @@ struct GraphFillRegion {
+ 
+     void add_match(pm::GraphFillRegion* match, const pm::CompressedEdge& edge);
+ 
++    /// Returns the actual top-level region by following authoritative parent links.
++    /// The non-const overload refreshes this region's blossom_parent_top cache.
++    GraphFillRegion* top_region();
++    const GraphFillRegion* top_region() const;
++
+     template <typename Callable>
+     void do_op_for_each_node_in_total_area(const Callable& f

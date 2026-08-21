@@ -1,0 +1,117 @@
+flooder.graph.nodes[2];
++
++    auto initialize_node = [&](DetectorNode &node, GraphFillRegion &region) {
++        node.reached_from_source = &node;
++        node.region_that_arrived = &region;
++        node.region_that_arrived_top = &region;
++        node.radius_of_arrival = 0;
++        node.wrapped_radius_cached = 0;
++        region.shell_area.push_back(&node);
++        node.node_event_tracker.set_desired_event({&node, cyclic_time_int{20}}, flooder.queue);
++    };
++    initialize_node(left_node, growing_left);
++    initialize_node(middle_node, frozen_middle);
++    initialize_node(right_node, growing_right);
++
++    growing_left.radius = VaryingCT::growing_value_at_time(3, 10);
++    frozen_middle.radius = VaryingCT::frozen(7);
++    growing_right.radius = VaryingCT::growing_value_at_time(5, 10);
++
++    std::vector<RegionEdge> children{
++        {&growing_left, {}},
++        {&frozen_middle, {}},
++        {&growing_right, {}},
++    };
++    auto *blossom = flooder.create_blossom(children);
++
++    // Growing children retain their already-valid frontier events. The frozen
++    // child changed slope and was therefore rescheduled (to no event here,
++    // because this test graph has no edges).
++    ASSERT_TRUE(left_node.node_event_tracker.has_desired_time);
++    ASSERT_EQ(left_node.node_event_tracker.desired_time, cyclic_time_int{20});
++    ASSERT_FALSE(middle_node.node_event_tracker.has_desired_time);
++    ASSERT_TRUE(right_node.node_event_tracker.has_desired_time);
++    ASSERT_EQ(right_node.node_event_tracker.desired_time, cyclic_time_int{20});
++
++    // Wrapping a growing child into a growing blossom preserves its trajectory.
++    ASSERT_EQ(left_node.local_radius().get_distance_at_time(25), 18);
++    ASSERT_EQ(right_node.local_radius().get_distance_at_time(25), 20);
++    // The frozen child acquires the new blossom's growth.
++    ASSERT_EQ(middle_node.local_radius().get_distance_at_time(25), 22);
++    ASSERT_EQ(left_node.top_region(), blossom);
++    ASSERT_EQ(middle_node.top_region(), blossom);
++    ASSERT_EQ(right_node.top_region(), blossom);
++}
+diff --git a/src/pymatching/sparse_blossom/matcher/mwpm.cc b/src/pymatching/sparse_blossom/matcher/mwpm.cc
+index 2dd7314..56febf5 100644
+--- a/src/pymatching/sparse_blossom/matcher/mwpm.cc
++++ b/src/pymatching/sparse_blossom/matcher/mwpm.cc
+@@ -304,7 +304,7 @@ GraphFillRegion *Mwpm::pair_and_shatter_subblossoms_and_extract_matches(GraphFil
+     for (auto &r : region->blossom_children) {
+         r.region->clear_blossom_parent_ignoring_wrapped_radius();
+     }
+-    auto subblossom = region->match.edge.loc_from->region_that_arrived_top;
++    auto subblossom = region->match.edge.loc_from->top_region();
+     subblossom->match = region->match;
+     if (subblossom->match.region)
+         subblossom->match.region->match.region = subblossom;
+@@ -363,7 +363,7 @@ GraphFillRegion *Mwpm::pair_and_shatter_subblossoms_and_extract_match_edges(
+     for (auto &r : region->blossom_children) {
+         r.region->clear_blossom_parent_ignoring_wrapped_radius();
+     }
+-    auto subblossom = region->match.edge.loc_from->region_that_arrived_top;
++    auto subblossom = region->match.edge.loc_from->top_region();
+     subblossom->match = region->match;
+     if (subblossom->match.region)
+         subblossom->match.region->match.region = subblossom;
+diff --git a/src/pymatching/sparse_blossom/matcher/mwpm.test.cc b/src/pymatching/sparse_blossom/matcher/mwpm.test.cc
+index e65b2d4..c261d65 100644
+--- a/src/pymatching/sparse_blossom/matcher/mwpm.test.cc
++++ b/src/pymatching/sparse_blossom/matcher/mwpm.test.cc
+@@ -685,3 +685,46 @@ TEST(GraphFlooder, RegionGrowingThenFrozenThenStartShrinking) {
+     ASSERT_EQ(
+         flooder.dequeue_valid(), FloodCheckEvent(flooder.graph.nodes[2].region_that_arrived, cyclic_time_int{80 + 4}));
+ }
++
++TEST(Mwpm, lazy_blossom_geometry_handles_deep_tight_cherry_chain) {
++    constexpr size_t k = 32;
++    constexpr size_t root = 0;
++    constexpr size_t terminal = 2 * k + 1;
++    auto x = [](size_t i) {
++        return 2 * i - 1;
++    };
++    auto y = [](size_t i) {
++        return 2 * i;
++    };
++
++    MatchingGraph graph(2 * k + 2, 0);
++    for (size_t i = 1; i <= k; i++) {
++        size_t attachment = i == 1 ? root : x(i - 1);
++        graph.add_edge(attachment, x(i), 2, {}, {});
++        graph.add_edge(attachment, y(i), 2, {}, {});
++        graph.add_edge(x(i), y(i), 2, {}, {});
++    }
++    graph.add_edge(x(k), terminal, 4, {}, {});
++
++    Mwpm mwpm(GraphFlooder(std::move(graph)));
++    for (auto &node : mwpm.flooder.graph.nodes) {
++        mwpm.create_detection_event(&node);
++    }
++    while (true) {
++        auto event = mwpm.flooder.run_until_next_mwpm_notification();
++        if (event.event_type == NO_EVENT) {
++            break;
++        }
++        mwpm.process_event(event);
++    }
++
++    ASSERT_EQ(mwpm.node_arena.allocated.size(), mwpm.node_arena.available.size());
++    MatchingResult result;
++    for (auto &node : mwpm.flooder.graph.nodes) {
++        if (node.region_that_arrived != nullptr) {
++            result += mwpm.shatter_blossom_and_extract_matches(node.top_region());
++        }
++    }
++    ASSERT_EQ(result.weight, 2 * k + 4);
++    ASSERT_EQ(result.obs_mask, 0);
++}
